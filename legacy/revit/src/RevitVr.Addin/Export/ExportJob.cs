@@ -115,12 +115,18 @@ public static class ExportJob
         ApplySpawnSanity(manifest);
         File.WriteAllText(jsonPath, manifest.ToJson());
 
+        // Per-railing detail beside the scene, so a railing that misbehaves in the headset can be
+        // traced to its ElementId instead of guessed at from coordinates.
+        File.WriteAllText(
+            Path.Combine(dir, "railings.json"),
+            System.Text.Json.JsonSerializer.Serialize(stats.Railings, SceneManifest.JsonOptions));
+
         sw.Stop();
 
         var message =
             $"Exported in {sw.Elapsed.TotalSeconds:0.0}s — {builder.TriangleCount:N0} tris, " +
             $"{builder.MaterialCount} materials, {stats.WallRuns} wall runs → {manifest.Segments.Count} colliders, " +
-            $"{stats.Openings} door openings cut.\n" +
+            $"{stats.Openings} door openings cut, {stats.RailingBoxes} railing colliders.\n" +
             $"{harvest.Elements:N0} elements, {harvest.Instances:N0} instances, {harvest.Solids:N0} solids." +
             (harvest.LightSourcesSkipped > 0
                 ? $"\n{harvest.LightSourcesSkipped} light-source meshes skipped."
@@ -130,6 +136,11 @@ public static class ExportJob
         if (stats.DoorsFound > 0 && stats.Openings == 0)
             message += $"\n\nWARNING: {stats.DoorsFound} doors found, none matched a wall. " +
                        "Doorways will be solid — send the log at " + App.LogPath;
+
+        if (stats.RailingsUnmeasured > 0)
+            message += $"\n\nWARNING: {stats.RailingsUnmeasured} railings could not be measured from their " +
+                       "geometry, so their barrier sits at the level's elevation. Railings on upper " +
+                       "floors will not stop you — send the log at " + App.LogPath;
 
         if (builder.TriangleCount > 750_000)
             message += "\n\nNote: this is a heavy scene for a standalone headset. Cropping the 3D view " +

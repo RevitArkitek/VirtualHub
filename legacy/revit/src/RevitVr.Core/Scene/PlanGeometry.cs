@@ -130,4 +130,57 @@ public static class PlanGeometry
 
     private static double Cross(PlanPoint o, PlanPoint a, PlanPoint b)
         => (a.X - o.X) * (b.Y - o.Y) - (a.Y - o.Y) * (b.X - o.X);
+
+    /// <summary>
+    /// Distance from a point to a plan polygon, zero inside it.
+    ///
+    /// This is how a railing's height gets measured at a point along its path: a long rail's
+    /// bounding box has corners only at its ends, so a sample in the middle of the rail is inside
+    /// the solid but far from every corner. Asking "which solids span this point" is the question
+    /// that has an answer everywhere along the rail.
+    /// </summary>
+    public static double DistanceToPolygon(IReadOnlyList<PlanPoint> polygon, double x, double y)
+    {
+        if (polygon.Count < 3) return double.MaxValue;
+        var distance = DistanceToPolygonEdge(polygon, x, y, out var inside);
+        return inside ? 0 : distance;
+    }
+
+    private static double DistanceToPolygonEdge(IReadOnlyList<PlanPoint> polygon, double x, double y, out bool inside)
+    {
+        var best = double.MaxValue;
+        for (var i = 0; i < polygon.Count; i++)
+        {
+            var a = polygon[i];
+            var b = polygon[(i + 1) % polygon.Count];
+
+            var dx = b.X - a.X;
+            var dy = b.Y - a.Y;
+            var len2 = dx * dx + dy * dy;
+
+            double t = len2 < 1e-12 ? 0 : Math.Clamp(((x - a.X) * dx + (y - a.Y) * dy) / len2, 0, 1);
+            var px = a.X + dx * t;
+            var py = a.Y + dy * t;
+            var dist = Math.Sqrt((x - px) * (x - px) + (y - py) * (y - py));
+            if (dist < best) best = dist;
+        }
+
+        inside = IsInside(polygon, x, y);
+        return best;
+    }
+
+    /// <summary>Crossing-number test. Polygons here are convex quads or hulls.</summary>
+    public static bool IsInside(IReadOnlyList<PlanPoint> polygon, double x, double y)
+    {
+        var inside = false;
+        for (int i = 0, j = polygon.Count - 1; i < polygon.Count; j = i++)
+        {
+            var pi = polygon[i];
+            var pj = polygon[j];
+            if (pi.Y > y != pj.Y > y &&
+                x < (pj.X - pi.X) * (y - pi.Y) / (pj.Y - pi.Y) + pi.X)
+                inside = !inside;
+        }
+        return inside;
+    }
 }

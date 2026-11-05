@@ -20,6 +20,13 @@ public sealed class WallSegment
     public float Y1 { get; set; }
     /// <summary>False for openings (door reveals) kept only for debug rendering.</summary>
     public bool Solid { get; set; } = true;
+
+    /// <summary>
+    /// Revit ElementId this barrier came from, when the exporter knows it. Carried so a collider
+    /// that misbehaves in the headset can be traced back to the element to fix, instead of
+    /// guessing from coordinates.
+    /// </summary>
+    public long? SourceId { get; set; }
 }
 
 /// <summary>A walkable horizontal plane used for ground snapping (floor slabs, roofs, stair treads).</summary>

@@ -18,11 +18,16 @@ function check(name, cond, detail = '') {
 
 // Walk a body towards a target in small steps, letting collision resolve each step.
 function walk(from, to, steps = 400) {
+  return walkAt(from, to, steps, FEET, HEAD);
+}
+
+// Same, for a body standing on a storey rather than on the ground.
+function walkAt(from, to, steps, feet, head) {
   const p = { x: from[0], z: from[1] };
   for (let i = 0; i < steps; i++) {
     p.x += (to[0] - from[0]) / steps;
     p.z += (to[1] - from[1]) / steps;
-    world.resolve(p, R, FEET, HEAD);
+    world.resolve(p, R, feet, head);
   }
   return p;
 }
@@ -166,6 +171,44 @@ check('oriented obstacle: stops at its own face', Math.abs(stopped - (halfT + 0.
 const aabbHalf = halfLen * Math.abs(ux30) + halfT * Math.abs(nx30);
 check('oriented obstacle: tighter than a world-axis box', stopped < aabbHalf,
   `oriented ${stopped.toFixed(2)} vs axis-aligned ${aabbHalf.toFixed(2)}`);
+
+// ---------------------------------------------------------------- railings
+// The demo's landing carries a guard rail: a 1 m barrier at landing height (1.7 m), which is the
+// shape a Revit railing collider arrives in. It has to stop you walking off the mezzanine while
+// leaving the floor beneath it and the stair route beside it alone.
+const rail = manifest.segments.find(
+  (s) => Math.abs(s.y0 - 1.7) < 0.02 && Math.abs(s.y1 - 2.7) < 0.02);
+check('demo scene carries a railing collider', !!rail,
+  'no segment with a landing-height barrier range');
+
+const offEdge = walkAt([9.5, 3.4], [9.5, 2.2], 400, 1.7, 3.4);
+check('railing stops you walking off the landing', offEdge.z > 3.05,
+  `ended at z=${offEdge.z.toFixed(3)}`);
+
+// A railing is a barrier with the railing's height range, not the storey's: standing under a
+// mezzanine guard rail must not be blocked by it, and standing on the mezzanine must be.
+const storeyRail = new CollisionWorld([{
+  x1: 0, z1: 0, x2: 4, z2: 0, thickness: 0.06, y0: 3.0, y1: 4.0,
+}], []);
+const beneath = { x: 2, z: 0.02 };
+storeyRail.resolve(beneath, R, 0, 1.72);
+check('railing one storey up does not block you below', Math.abs(beneath.z - 0.02) < 1e-6,
+  `moved to z=${beneath.z}`);
+
+const onTop = { x: 2, z: 0.02 };
+storeyRail.resolve(onTop, R, 3.0, 4.72);
+check('the same railing blocks you on the mezzanine', Math.abs(onTop.z - 0.02) > 0.15,
+  `ejected to z=${onTop.z.toFixed(2)}`);
+
+// and the stair route along the railing stays walkable, all the way up to the landing
+let sy = 0, sx = 6.2;
+for (let i = 0; i < 360; i++) {
+  sx += 0.01;
+  const g = world.groundAt(sx, 3.35, sy, 0.45, 3.0);
+  if (g !== null) sy = g;
+}
+check('stairs beside the railing still climb to the landing', Math.abs(sy - 1.7) < 0.02,
+  `ended at y=${sy.toFixed(2)}`);
 
 console.log(`\n${pass} passed, ${fail} failed   (${world.stats.tests} narrow-phase tests)`);
 console.log(`grid: ${world.segments.length} segments in ${world.stats.gridCells} cells`);

@@ -65,6 +65,19 @@ for (var i = 0; i < Steps; i++)
 }
 AxisBox(g, steelMat, LandingX, 0f, StairZ0, 9.9f, Riser * Steps, StairZ1);
 
+// --- a guard rail along the open edge of the landing -------------------------
+// 1 m of barrier at landing height. In a Revit export this is a railing collider from
+// Railing.GetPath(); here it stands in for one so the viewer and the collision test can prove
+// that a mezzanine edge stops you.
+const float RailTop = Riser * Steps + 1.0f;
+AxisBox(g, steelMat, LandingX, RailTop - 0.08f, StairZ0 - 0.03f, 9.9f, RailTop, StairZ0 + 0.03f);
+AxisBox(g, steelMat, LandingX, Riser * Steps + 0.5f, StairZ0 - 0.02f, 9.9f, Riser * Steps + 0.55f, StairZ0 + 0.02f);
+for (var i = 0; i <= 2; i++)
+{
+    var px = LandingX + (9.9f - LandingX) * i / 2f;
+    AxisBox(g, steelMat, px - 0.03f, Riser * Steps, StairZ0 - 0.03f, px + 0.03f, RailTop, StairZ0 + 0.03f);
+}
+
 // --- a sloped lawn outside the south door, so terrain walking can be tested --
 var grassMat = g.GetMaterial("Grass", 0.30f, 0.40f, 0.20f, roughness: 1f);
 const float LawnX0 = -2f, LawnX1 = 12f, LawnZ0 = 4.1f, LawnZ1 = 12f, LawnRise = 2.0f;
@@ -129,6 +142,14 @@ m.Terrain = lawnTris;
 m.Segments.Add(new WallSegment
 {
     X1 = 7.2f, Z1 = 1.7f, X2 = 8.6f, Z2 = 1.7f, Thickness = 1.4f, Y0 = 0f, Y1 = 0.75f,
+});
+
+// the landing guard rail, emitted the way a Revit railing is: a thin box whose height range is
+// the railing itself, so it stops you at landing level and not on the floor beneath it
+m.Segments.Add(new WallSegment
+{
+    X1 = LandingX, Z1 = StairZ0, X2 = 9.9f, Z2 = StairZ0,
+    Thickness = 0.10f, Y0 = Riser * Steps, Y1 = RailTop,
 });
 
 File.WriteAllText(Path.Combine(outDir, "colliders.json"), m.ToJson());

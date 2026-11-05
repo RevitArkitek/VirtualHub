@@ -26,8 +26,8 @@ Built and verified on this machine (Revit 2025, .NET 8, Quest path via adb):
 | Revit add-in (ribbon, export, collider harvest) | compiles against real `RevitAPI.dll` / `RevitAPIUI.dll` |
 | GLB writer | passes the official Khronos `gltf-validator` — 0 errors, 0 warnings |
 | Door cut-out geometry | 19/19 assertions on the shipped code (straight, curved and overlapping cases) |
-| Minimum-area footprint fitting | 12/12 (rotated rectangles, circles, degenerate input) |
-| Collision engine | 24/24 headless assertions — walls, doorways, stairs, terrain, oriented obstacles |
+| Collider geometry (fitting, railing paths, containment) | 48/48 (rectangles, circles, degenerate input, measured heights, dropped phantom pieces, resampling, point-in-solid) |
+| Collision engine | 29/29 headless assertions — walls, doorways, stairs, terrain, oriented obstacles, railings |
 | WebXR viewer | loads, renders, walks, climbs, collides in a real browser |
 | Local server | serves viewer + scene, HTTP loopback and HTTPS LAN; certificate persisted |
 | Installer | `dist\` assembled, installed to Revit's addins folder, deployment re-checked |
@@ -49,9 +49,11 @@ in the export dialog, and each has a documented meaning:
 |---|---|
 | `elements, instances, solids` | `instances` near zero means family instances aren't being reached |
 | `wall runs → N wall segments, M obstacle boxes` | `M` zero means the obstacle categories aren't matching your families |
+| `railings: N found → M colliders (P height-measured, Q path-elevation, F footprint)` | `Q > 0` means those railings had no geometry to measure, so their barrier sits at the level's elevation and may be a storey off; `M` zero means railings exist but none produced a barrier |
 | `doors: N found, M cut` | `M < N` means some door hosts aren't resolving |
 | `surfaces, treads, terrain triangles` | zero treads/terrain means the geometry didn't produce walkable faces |
 | `light-source meshes skipped` | absent means the name heuristic missed your fixture families |
+| `N railings lost path pieces` | those railings have gaps in their barrier — `railings.json` names them by ElementId |
 
 ### Operational gotchas
 
@@ -102,7 +104,7 @@ The viewer is decoupled from Revit on purpose, so the whole runtime can be exerc
 synthetic scene:
 
 ```powershell
-dotnet run --project tools/demogen -- runtime/export      # two rooms, one doorway
+dotnet run --project tools/demogen -- runtime/export      # two rooms, a doorway, a stair and its guard rail
 dotnet run --project src/RevitVr.Server -- --app vr-web --scene runtime/export --port 8765
 ```
 
@@ -119,11 +121,17 @@ node tools/gltfcheck/validate.mjs runtime/export/scene.glb
 # door cut-outs land in the right place on the wall (the code the add-in actually runs)
 dotnet run --project tools/test-wallcut
 
-# walls block, doorways pass, corners hold, storeys don't interfere
+# footprint fitting and railing path boxes: the arithmetic behind every collider
+dotnet run --project tools/test-planrect
+
+# walls block, doorways pass, corners hold, storeys don't interfere, railings hold the edge
 node tools/test-collision.mjs runtime/export/colliders.json
 
 # the installed add-in resolves: class names, interfaces, and every asset path Revit will need
 dotnet run --project tools/addincheck
+
+# railing colliders are railing-sized and agree with what renders (one storey off, or four metres tall)
+node tools/railcheck.mjs runtime/export
 ```
 
 ## How this differs from Enscape
@@ -185,6 +193,25 @@ add-in derives collision from the *model data instead of the render mesh*:
   its own area — and emitted as the same oriented box walls use, so the viewer needs no extra
   collision path. Doors are deliberately excluded: the wall gets a gap instead, and the leaf
   stays passable;
+- **railings** become thin boxes along `Railing.GetPath()`, at the height their geometry actually
+  occupies rather than the path's own Z. That distinction is the whole bug this feature had:
+  `GetPath()` reports the path at the *level's* elevation, so a railing on an upper floor arrives
+  flat at that floor's Z, and a barrier raised from it sits one storey below the railing — you
+  walk through the railing upstairs and are stopped by nothing downstairs, in open space. Each
+  path point is therefore measured against the railing's own geometry for its bottom and top,
+  along the path every 600 mm rather than only at its vertices — a straight path arrives as two
+  points, and measuring those alone spans a whole stair flight and yields a four-metre-tall box.
+  The measured span is clamped to the railing type's own height, because the measuring disc is a
+  plan disc and can otherwise catch whatever is stacked above the railing. Path pieces that run
+  past the visible railing are dropped rather than left as colliders in open space. Measuring
+  asks *which solids span this point*, not which bounding-box corners are near it: a 4 m rail's
+  corners sit only at its ends, so a corner test leaves holes between posts — and a hole is a
+  railing you walk through. A railing whose geometry cannot be read at all is emitted at the path
+  elevation and counted in the export report, because that is the case that hides a railing.
+  Every railing collider carries its `sourceId`, and `railings.json` beside the scene records what
+  each railing element produced (`measured` / `path-elevation` / `footprint` / `none`), how many
+  path samples found no geometry, and its height — so a railing that misbehaves in the headset can
+  be traced to an ElementId instead of guessed at from coordinates;
 - a light fixture's photometric web — the mesh that shows how light spreads — is skipped, since
   it is a modelling aid rather than building fabric.
 
@@ -223,6 +250,7 @@ src/RevitVr.Server/      Kestrel static server: viewer at /, scene at /scene/, /
 vr-web/                  WebXR viewer: three.js, locomotion, collision
 tools/demogen/           synthetic two-room scene in the export format
 tools/test-collision.mjs acceptance test for the collision rules
+tools/railcheck.mjs     railing colliders vs the geometry that actually renders
 tools/gltfcheck/         Khronos gltf-validator wrapper
 tools/addincheck/        verifies the deployed add-in resolves
 tools/mkicon/            draws the ribbon icons

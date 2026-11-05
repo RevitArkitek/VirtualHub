@@ -1,4 +1,5 @@
 using Autodesk.Revit.DB;
+using Autodesk.Revit.DB.Architecture;
 using RevitVr.Core.Scene;
 
 namespace RevitVr.Addin.Export;
@@ -9,7 +10,30 @@ public sealed record ColliderStats(
     int Openings,
     int DoorsFound,
     int DoorsMatched,
-    int DoorsUnmatched);
+    int DoorsUnmatched,
+    int RailingBoxes,
+    int RailingsUnmeasured,
+    IReadOnlyList<RailingReport> Railings);
+
+/// <summary>
+/// What one railing produced, written to railings.json beside the scene.
+///
+/// Without this a collider that misbehaves in the headset can only be described by its
+/// coordinates; with it, an ElementId the user names in Revit leads straight to what the
+/// exporter did with that element and why.
+/// </summary>
+public sealed record RailingReport(
+    long Id,
+    string? TypeName,
+    int PathCurves,
+    double PathLengthFt,
+    int Samples,
+    int SamplesWithoutGeometry,
+    int Boxes,
+    string Outcome,
+    double HeightFt,
+    float MinY,
+    float MaxY);
 
 /// <summary>
 /// Derives the walkable world from Revit elements analytically instead of from the render mesh.
@@ -121,24 +145,420 @@ public static class ColliderExtractor
         var treads = AddStairSurfaces(doc, view, manifest);
         var terrainTris = AddTerrainTriangles(doc, view, manifest);
         var obstacles = AddInstanceObstacles(doc, view, manifest);
+        var railings = AddRailingColliders(doc, view, manifest);
 
         manifest.Warnings.Add(
             $"{runs.Count} wall runs → {wallSegments} wall segments, {obstacles} obstacle boxes; doors: " +
             $"{doorStats.Found} found, {doorStats.Matched} cut, {doorStats.Unmatched} unmatched; " +
+            $"railings: {railings.Found} found → {railings.Boxes} colliders " +
+            $"({railings.Measured} height-measured, {railings.Unmeasured} path-elevation, " +
+            $"{railings.FromFootprint} footprint); " +
             $"{manifest.Surfaces.Count - treads} floor/roof surfaces, {treads} stair treads, " +
             $"{terrainTris} terrain triangles");
 
         if (doorStats.Found > 0 && doorStats.Matched == 0)
             manifest.Warnings.Add("Every door failed to match a wall — doorways will be impassable.");
+        if (railings.Found > 0 && railings.Boxes == 0)
+            manifest.Warnings.Add(
+                "Railings were found but produced no collider — you can walk through them.");
+        var dropped = railings.Reports.Count(r => r.Outcome == "measured" && r.SamplesWithoutGeometry > 0);
+        if (dropped > 0)
+            manifest.Warnings.Add(
+                $"{dropped} railings lost path pieces where no railing geometry spanned the path; " +
+                "see railings.json for the element ids, and check those railings in the headset.");
+
+        if (railings.Unmeasured > 0)
+            manifest.Warnings.Add(
+                $"{railings.Unmeasured} railings had no geometry to measure their height from; their " +
+                "barrier sits at the path elevation, which is the level rather than the railing. " +
+                "Railings on upper floors may not stop you.");
         if (manifest.Surfaces.Count == 0)
             manifest.Warnings.Add("No floor slabs in view; using level elevations for walking height");
 
         return new ColliderStats(
             runs.Count, manifest.Segments.Count, openings,
-            doorStats.Found, doorStats.Matched, doorStats.Unmatched);
+            doorStats.Found, doorStats.Matched, doorStats.Unmatched,
+            railings.Boxes, railings.Unmeasured, railings.Reports);
     }
 
     private readonly record struct DoorStats(int Found, int Matched, int Unmatched);
+
+    private readonly record struct RailingStats(
+        int Found, int Measured, int Unmeasured, int FromFootprint, int Boxes,
+        IReadOnlyList<RailingReport> Reports);
+
+
+    /// <summary>
+    /// Railings become thin boxes along their own path, at the height their geometry actually
+    /// occupies.
+    ///
+    /// Both halves of that sentence were learned the hard way. <c>Railing.GetPath()</c> reports
+    /// the path at the *level's* elevation, not the railing's: a railing on an upper floor comes
+    /// back flat at that floor's Z. Trusting it puts the barrier one storey below the railing, so
+    /// you walk through it upstairs and are stopped by nothing downstairs. The height range is
+    /// therefore measured from the railing's own geometry at each path point, which also drops
+    /// path pieces that run on past the visible railing instead of leaving a collider in open
+    /// space.
+    /// </summary>
+    private static RailingStats AddRailingColliders(Document doc, View view, SceneManifest manifest)
+    {
+        // A collider is a barrier, not a drawing: thick enough to be a barrier and no thicker,
+        // since the player's own radius already keeps them off it.
+        const double ThicknessFt = 0.1 / Ft;
+
+        // How far outside a solid a path point may sit and still count as inside it. The path
+        // should run through its own railing; this only absorbs sketch slop.
+        const double MeasureToleranceFt = 0.15 / Ft;
+
+        // Distance between measurements along a path. A straight railing arrives as two points,
+        // so this is what makes the barrier follow a stair instead of spanning the whole flight.
+        const double SampleSpacingFt = 0.6 / Ft;
+
+        // A path point that only finds a bracket or the edge of one rail is not a railing.
+        const double MinBarrierFt = 0.3 / Ft;
+
+        // A measured span outside this band around the railing type's own height means the
+        // measurement caught something else — the flight above, or a single rail — so the type
+        // height wins.
+        const double MaxSpanRatio = 1.35;
+        const double MinSpanRatio = 0.4;
+
+        var found = 0;
+        var measured = 0;
+        var unmeasured = 0;
+        var fromFootprint = 0;
+        var boxes = 0;
+        var emitted = new HashSet<(int, int, int, int, int, int)>();
+        var reports = new List<RailingReport>();
+
+        var railings = new FilteredElementCollector(doc, view.Id)
+            .OfCategory(BuiltInCategory.OST_StairsRailing)
+            .WhereElementIsNotElementType()
+            .ToElements();
+
+        foreach (var element in railings)
+        {
+            found++;
+
+            var height = RailingHeight(doc, element);
+            var candidates = new List<WallSegment>();
+            var outcome = "none";
+            var samples = 0;
+            var samplesMissing = 0;
+            var pathLength = 0.0;
+            var pathCurves = 0;
+
+            var spans = new List<SolidSpan>();
+            var haveGeometry = TryCollectSpans(element, spans);
+
+            IList<Curve>? path = null;
+            if (element is Railing railing)
+            {
+                // a railing whose sketch is broken can throw rather than return an empty list
+                try { path = railing.GetPath(); }
+                catch { path = null; }
+            }
+
+            if (path is { Count: > 0 })
+            {
+                pathCurves = path.Count;
+
+                // ---- 1. the railing's own path, at measured heights ---------------
+                foreach (var curve in path)
+                {
+                    if (curve is null) continue;
+                    pathLength += curve.Length;
+
+                    var verts = Tessellate(curve);
+                    if (verts.Count < 2) continue;
+
+                    // Measure along the path, not only at its vertices: a straight railing comes
+                    // back as two points, and sampling just those makes one 4 m box out of a
+                    // whole stair flight.
+                    var along = ColliderGeometry.Resample(
+                        verts.Select(p => (p.X, p.Y, p.Z)).ToList(), SampleSpacingFt);
+
+                    var samplesHere = new List<ColliderGeometry.PathSample>(along.Count);
+                    foreach (var p in along)
+                    {
+                        samples++;
+
+                        var barrier = haveGeometry
+                            ? MeasureBarrier(spans, p.X, p.Y, MeasureToleranceFt)
+                            : null;
+
+                        if (barrier is null)
+                        {
+                            // no part of the railing spans this point: either the path runs past
+                            // the railing, or a baluster gap leaves nothing to measure
+                            samplesMissing++;
+                            samplesHere.Add(ColliderGeometry.PathSample.Missing(p.X, p.Y));
+                            continue;
+                        }
+
+                        var (bottom, top) = barrier.Value;
+
+                        var span = top - bottom;
+                        if (span > height * MaxSpanRatio || span < height * MinSpanRatio)
+                            top = bottom + Math.Max(height, MinBarrierFt);
+
+                        samplesHere.Add(new ColliderGeometry.PathSample(p.X, p.Y, bottom, top));
+                    }
+
+                    var pieces = ColliderGeometry.AlongPath(samplesHere, ThicknessFt);
+                    if (pieces.Count > 0)
+                    {
+                        candidates.AddRange(pieces);
+                        if (outcome == "none") outcome = "measured";
+                    }
+                }
+
+                // ---- 2. no usable heights: raise the barrier from the path itself -
+                if (candidates.Count == 0)
+                {
+                    // Correct only when the path really is at the railing's elevation. Counted
+                    // separately and reported, because it is the failure that hides a railing.
+                    foreach (var curve in path)
+                    {
+                        if (curve is null) continue;
+                        var pts = Tessellate(curve).Select(p => (p.X, p.Y, p.Z)).ToList();
+                        candidates.AddRange(ColliderGeometry.AlongPath(pts, height, ThicknessFt));
+                    }
+
+                    if (candidates.Count > 0) outcome = "path-elevation";
+                }
+            }
+
+            // ---- 3. no path at all: fit the footprint -----------------------------
+            if (candidates.Count == 0)
+            {
+                // Conservative on purpose. One box over the whole railing cannot leak, and a
+                // leakable railing means walking off a stair — a corner cut off a landing is the
+                // better failure. Reported in the export line so it is visible when it happens.
+                GeometryElement? geometry;
+                try { geometry = element.get_Geometry(FineOptions()); }
+                catch { geometry = null; }
+
+                var plan = new List<PlanPoint>();
+                var minY = double.MaxValue;
+                var maxY = double.MinValue;
+
+                if (geometry is not null)
+                {
+                    CollectObstaclePoints(geometry, Transform.Identity, plan, ref minY, ref maxY, 0);
+                }
+                else
+                {
+                    var bbox = element.get_BoundingBox(view) ?? element.get_BoundingBox(null);
+                    if (bbox is not null)
+                    {
+                        plan.Add(new PlanPoint(bbox.Min.X, bbox.Min.Y));
+                        plan.Add(new PlanPoint(bbox.Max.X, bbox.Min.Y));
+                        plan.Add(new PlanPoint(bbox.Max.X, bbox.Max.Y));
+                        plan.Add(new PlanPoint(bbox.Min.X, bbox.Max.Y));
+                        minY = bbox.Min.Z;
+                        maxY = bbox.Max.Z;
+                    }
+                }
+
+                if (plan.Count >= 3 && maxY > minY)
+                {
+                    var fit = PlanGeometry.MinAreaRect(plan);
+                    if (fit is not null)
+                    {
+                        var top = Math.Max(maxY, minY + height);
+                        var segment = ColliderGeometry.FromRect(fit.Value, minY, top);
+                        if (segment is not null)
+                        {
+                            candidates.Add(segment);
+                            outcome = "footprint";
+                        }
+                    }
+                }
+            }
+
+            var added = Emit(manifest, candidates, emitted, element.Id.Value);
+
+            switch (outcome)
+            {
+                case "measured": measured++; break;
+                case "path-elevation": unmeasured++; break;
+                case "footprint": fromFootprint++; break;
+            }
+
+            boxes += added;
+            reports.Add(new RailingReport(
+                element.Id.Value,
+                doc.GetElement(element.GetTypeId())?.Name,
+                pathCurves,
+                Math.Round(pathLength * Ft, 3),
+                samples,
+                samplesMissing,
+                added,
+                outcome,
+                Math.Round(height * Ft, 3),
+                candidates.Count > 0 ? candidates.Min(s => s.Y0) : 0f,
+                candidates.Count > 0 ? candidates.Max(s => s.Y1) : 0f));
+        }
+
+        return new RailingStats(found, measured, unmeasured, fromFootprint, boxes, reports);
+    }
+
+    /// <summary>
+    /// Emits a railing's boxes, skipping any the model already contributed at the same place —
+    /// a railing often arrives with its handrail as a second element on the same line — and
+    /// stamping each with the element it came from.
+    /// </summary>
+    private static int Emit(
+        SceneManifest manifest, List<WallSegment> candidates,
+        HashSet<(int, int, int, int, int, int)> seen, long sourceId)
+    {
+        var added = 0;
+        foreach (var s in candidates)
+        {
+            var key = (
+                (int)Math.Round(s.X1 * 100), (int)Math.Round(s.Z1 * 100),
+                (int)Math.Round(s.X2 * 100), (int)Math.Round(s.Z2 * 100),
+                (int)Math.Round(s.Y0 * 100), (int)Math.Round(s.Y1 * 100));
+
+            if (!seen.Add(key)) continue;
+
+            s.SourceId = sourceId;
+            manifest.Segments.Add(s);
+            added++;
+        }
+        return added;
+    }
+
+    /// <summary>One solid of a railing, reduced to its plan shape and vertical extent (feet).</summary>
+    private sealed class SolidSpan
+    {
+        public required List<PlanPoint> Plan;
+        public double MinZ, MaxZ;
+    }
+
+    /// <summary>
+    /// Bottom and top of the railing at a plan point, in feet, or null when no part of the railing
+    /// spans that point — the signal that the path has run past the railing.
+    ///
+    /// Asking which solids span the point, rather than which corners are nearby, is what makes
+    /// this work along a rail. A 4 m rail's bounding box has corners only at its ends, so a point
+    /// in the middle of the rail is inside the solid and nowhere near a corner; measuring corners
+    /// therefore leaves gaps between posts, which is a hole you can walk through.
+    /// </summary>
+    private static (double Bottom, double Top)? MeasureBarrier(
+        List<SolidSpan> solids, double x, double y, double tolerance)
+    {
+        var found = false;
+        var bottom = double.MaxValue;
+        var top = double.MinValue;
+
+        foreach (var solid in solids)
+        {
+            if (PlanGeometry.DistanceToPolygon(solid.Plan, x, y) > tolerance) continue;
+            found = true;
+            if (solid.MinZ < bottom) bottom = solid.MinZ;
+            if (solid.MaxZ > top) top = solid.MaxZ;
+        }
+
+        return found ? (bottom, top) : null;
+    }
+
+    private static bool TryCollectSpans(Element element, List<SolidSpan> spans)
+    {
+        GeometryElement? geometry;
+        try { geometry = element.get_Geometry(FineOptions()); }
+        catch { return false; }
+        if (geometry is null) return false;
+
+        CollectSpans(geometry, Transform.Identity, spans, 0);
+        return spans.Count > 0;
+    }
+
+    private static void CollectSpans(
+        GeometryElement geometry, Transform transform, List<SolidSpan> spans, int depth)
+    {
+        if (depth > 10) return;
+
+        foreach (var obj in geometry)
+        {
+            switch (obj)
+            {
+                case GeometryInstance instance:
+                {
+                    GeometryElement? symbol;
+                    try { symbol = instance.GetSymbolGeometry(); }
+                    catch { continue; }
+                    if (symbol is null) continue;
+                    CollectSpans(symbol, transform.Multiply(instance.Transform), spans, depth + 1);
+                    break;
+                }
+
+                case Solid solid when solid.Faces.Size > 0:
+                {
+                    var box = solid.GetBoundingBox();
+                    if (box is null) break;
+
+                    var corners = new List<PlanPoint>(4);
+                    var minZ = double.MaxValue;
+                    var maxZ = double.MinValue;
+
+                    // the four plan corners, taken at both heights so a tilted solid still reports
+                    // its true vertical extent
+                    for (var i = 0; i < 4; i++)
+                    {
+                        var x = (i & 1) == 0 ? box.Min.X : box.Max.X;
+                        var y = (i & 2) == 0 ? box.Min.Y : box.Max.Y;
+
+                        var low = transform.OfPoint(box.Transform.OfPoint(new XYZ(x, y, box.Min.Z)));
+                        var high = transform.OfPoint(box.Transform.OfPoint(new XYZ(x, y, box.Max.Z)));
+
+                        corners.Add(new PlanPoint(low.X, low.Y));
+                        minZ = Math.Min(minZ, Math.Min(low.Z, high.Z));
+                        maxZ = Math.Max(maxZ, Math.Max(low.Z, high.Z));
+                    }
+
+                    spans.Add(new SolidSpan { Plan = corners, MinZ = minZ, MaxZ = maxZ });
+                    break;
+                }
+
+                case Mesh mesh when mesh.NumTriangles > 0:
+                {
+                    var corners = new List<PlanPoint>();
+                    var minZ = double.MaxValue;
+                    var maxZ = double.MinValue;
+
+                    foreach (var v in mesh.Vertices)
+                    {
+                        var world = transform.OfPoint(v);
+                        corners.Add(new PlanPoint(world.X, world.Y));
+                        minZ = Math.Min(minZ, world.Z);
+                        maxZ = Math.Max(maxZ, world.Z);
+                    }
+
+                    var hull = PlanGeometry.ConvexHull(corners);
+                    if (hull.Count >= 3)
+                        spans.Add(new SolidSpan { Plan = hull, MinZ = minZ, MaxZ = maxZ });
+                    break;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Height of the barrier above the railing's path, in feet.
+    ///
+    /// A railing type without a top rail reports zero, and a nonsense number here decides whether
+    /// the railing stops you at all, so anything outside a plausible railing height falls back to
+    /// the 914 mm code default.
+    /// </summary>
+    private static double RailingHeight(Document doc, Element element)
+    {
+        const double Default = 3.0;                 // 914 mm
+        var type = doc.GetElement(element.GetTypeId()) as RailingType;
+        var height = type?.TopRailHeight ?? 0;
+        return height > 0.5 && height < 12 ? height : Default;
+    }
 
     /// <summary>
     /// Cuts a gap in whichever wall each door belongs to.
@@ -535,13 +955,6 @@ public static class ColliderExtractor
 
     private static int AddInstanceObstacles(Document doc, View view, SceneManifest manifest)
     {
-        var options = new Options
-        {
-            ComputeReferences = false,
-            IncludeNonVisibleObjects = false,
-            DetailLevel = ViewDetailLevel.Fine,
-        };
-
         var added = 0;
 
         foreach (var category in ObstacleCategories)
@@ -551,7 +964,7 @@ public static class ColliderExtractor
                          .WhereElementIsNotElementType())
             {
                 GeometryElement? geometry;
-                try { geometry = element.get_Geometry(options); }
+                try { geometry = element.get_Geometry(FineOptions()); }
                 catch { continue; }
                 if (geometry is null) continue;
 
@@ -566,28 +979,30 @@ public static class ColliderExtractor
                 var fit = PlanGeometry.MinAreaRect(points);
                 if (fit is null) continue;
 
-                var rect = fit.Value;
-                if (rect.Area < 0.01 / (Ft * Ft)) continue;   // smaller than 100 cm² in plan
-
                 // Emitted as an oriented box, which is the same primitive walls use — so the
                 // viewer's existing capsule push-out handles furniture with no new code path.
-                manifest.Segments.Add(new WallSegment
-                {
-                    X1 = (float)((rect.Cx - rect.Ux * rect.HalfLength) * Ft),
-                    Z1 = (float)(-(rect.Cy - rect.Uy * rect.HalfLength) * Ft),
-                    X2 = (float)((rect.Cx + rect.Ux * rect.HalfLength) * Ft),
-                    Z2 = (float)(-(rect.Cy + rect.Uy * rect.HalfLength) * Ft),
-                    Thickness = (float)Math.Max(2 * rect.HalfThickness * Ft, 0.02),
-                    Y0 = (float)(minY * Ft),
-                    Y1 = (float)(maxY * Ft),
-                });
+                var segment = ColliderGeometry.FromRect(fit.Value, minY, maxY);
+                if (segment is null) continue;
 
+                manifest.Segments.Add(segment);
                 added++;
             }
         }
 
         return added;
     }
+
+    /// <summary>
+    /// Shared geometry request for collision harvests. Fine detail is forced regardless of the
+    /// source view's settings, for the same reason the render export does: a coarse view would
+    /// otherwise hide the geometry the collider is fitted to.
+    /// </summary>
+    private static Options FineOptions() => new()
+    {
+        ComputeReferences = false,
+        IncludeNonVisibleObjects = false,
+        DetailLevel = ViewDetailLevel.Fine,
+    };
 
     private static void CollectObstaclePoints(GeometryElement geometry, Transform transform,
         List<PlanPoint> points, ref double minY, ref double maxY, int depth)

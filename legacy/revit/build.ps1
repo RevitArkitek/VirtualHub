@@ -27,7 +27,18 @@ $RevitDir = $RevitDir.TrimEnd('\', '/') + '/'
 $RevitDirFs = $RevitDir.Replace('/', '\')
 
 $dotnet = (Get-Command dotnet -ErrorAction SilentlyContinue)
+if (-not $dotnet) {
+  # A user-local SDK (dotnet-install.ps1 into ~\.dotnet) is not on PATH until the next logon.
+  $localDotnet = Join-Path $HOME ".dotnet\dotnet.exe"
+  if (Test-Path $localDotnet) {
+    $dotnet = $localDotnet
+    $env:PATH = "$(Split-Path $localDotnet);$env:PATH"
+  }
+}
 if (-not $dotnet) { throw "dotnet SDK not found on PATH." }
+if (-not (& dotnet --list-sdks)) {
+  throw "dotnet is installed but has no SDK (runtime only). Install one: https://aka.ms/dotnet/download"
+}
 if (-not (Test-Path (Join-Path $RevitDirFs "RevitAPI.dll"))) {
   throw "RevitAPI.dll not found in '$RevitDirFs'. Pass -RevitDir explicitly."
 }
