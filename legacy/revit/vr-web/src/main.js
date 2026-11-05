@@ -9,6 +9,7 @@ const WALK = 1.65;         // m/s
 const RUN = 3.4;
 const SNAP = Math.PI / 6;  // 30 degrees
 const DEAD = 0.18;
+const BOOST = 3.0;         // left trigger held: movement speed multiplier (walk, fly, climb)
 
 const app = {
   ready: false,
@@ -196,8 +197,12 @@ function flash(t) {
 /**
  * Applies one movement step. Kept separate from the render loop so the headless
  * test harness can drive it deterministically.
+ *
+ * `boost` is the fast-navigation multiplier (left trigger held) and scales every axis that
+ * moves the rig — travel and climb alike — but never the snap turn, which stays one 30°
+ * step so fast navigation cannot spin someone by accident.
  */
-function step(dt, wish, turn) {
+function step(dt, wish, turn, boost = false) {
   if (!app.world) return;
 
   // horizontal basis from where the head is actually looking
@@ -207,7 +212,7 @@ function step(dt, wish, turn) {
   dir.normalize();
   const right = tmpV2.crossVectors(dir, UP).normalize();
 
-  const speed = (keys.has('ShiftLeft') || keys.has('ShiftRight')) ? RUN : WALK;
+  const speed = ((keys.has('ShiftLeft') || keys.has('ShiftRight')) ? RUN : WALK) * (boost ? BOOST : 1);
   const dx = (dir.x * wish.y + right.x * wish.x) * speed * dt;
   const dz = (dir.z * wish.y + right.z * wish.x) * speed * dt;
 
@@ -241,6 +246,9 @@ function step(dt, wish, turn) {
 }
 
 function snapTurn(angle) {
+  // +angle rotates the rig about +Y, which is a *left* turn (right-handed, counter-clockwise
+  // seen from above). Callers that think in "turn right" pass a negative angle — see
+  // turnFromAxis().
   const head = app.camera.getWorldPosition(new THREE.Vector3());
   const delta = head.clone().sub(app.rig.position);
   delta.applyAxisAngle(UP, angle);
@@ -249,27 +257,47 @@ function snapTurn(angle) {
   if (!renderer.xr.isPresenting) yaw = app.rig.rotation.y;
 }
 
-function readThumbsticks() {
+/**
+ * Right stick X axis → rotation to hand snapTurn().
+ *
+ * WebXR reports +x for "pushed right", and a positive rotation about +Y turns you *left*, so
+ * the sign flips here: push the stick right and you turn right.
+ */
+function turnFromAxis(ax) {
+  return -Math.sign(ax);
+}
+
+function readThumbsticks(sources = renderer.xr.getSession()?.inputSources ?? []) {
   let wish = { x: 0, y: 0 };
   let turn = 0;
-  for (const src of renderer.xr.getSession()?.inputSources ?? []) {
+  let rightY = 0;   // right stick Y, forward positive. Fly mode: the climb axis.
+  let boost = false;   // left trigger held: fast navigation
+  for (const src of sources) {
     const gp = src.gamepad;
     if (!gp || !gp.axes || gp.axes.length < 4) continue;
     const ax = gp.axes[2], ay = gp.axes[3];
-    if (Math.abs(ax) < DEAD && Math.abs(ay) < DEAD) continue;
     if (src.handedness === 'right') {
-      // snap turn latch so one push = one 30 degree step
-      if (Math.abs(ax) > 0.7 && app.yawLatch === 0) {
-        turn = Math.sign(ax);
-        app.yawLatch = Math.sign(ax);
-      } else if (Math.abs(ax) < 0.4) {
+      // Climb and snap turn are independent: the stick can do both at once, so the turn latch
+      // gates the turn only and never the Y axis.
+      if (Math.abs(ay) >= DEAD) rightY = -ay;
+      // Snap turn latch so one push = one 30 degree step. Release is checked *before* the
+      // deadzone skip, because letting go parks the stick at (0,0) — the case that a
+      // deadzone-first skip would hide, leaving the latch stuck and the stick dead for the
+      // rest of the session.
+      if (Math.abs(ax) < 0.4) {
         app.yawLatch = 0;
+      } else if (Math.abs(ax) > 0.7 && app.yawLatch === 0) {
+        turn = turnFromAxis(ax);
+        app.yawLatch = Math.sign(ax);
       }
     } else {
-      wish = { x: ax, y: -ay };
+      // Left hand — and any source the runtime does not label — travels the rig, and its
+      // index trigger (xr-standard button 0) is the fast-navigation boost.
+      if (gp.buttons && gp.buttons[0] && gp.buttons[0].pressed) boost = true;
+      if (Math.abs(ax) >= DEAD || Math.abs(ay) >= DEAD) wish = { x: ax, y: -ay };
     }
   }
-  return { wish, turn };
+  return { wish, turn, rightY, boost };
 }
 
 // ---------------------------------------------------------------- loop
@@ -277,9 +305,12 @@ const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.05);
   if (renderer.xr.isPresenting) {
-    const { wish, turn } = readThumbsticks();
-    if (app.fly) step(dt, { x: wish.x, y: 0, fly: wish.y }, turn);
-    else step(dt, { x: wish.x, y: wish.y, fly: 0 }, turn);
+    const { wish, turn, rightY, boost } = readThumbsticks();
+    // Fly: left stick travels (forward/back and strafe) exactly as it does on foot, and the
+    // right stick's Y is the climb axis — push forward to rise, pull back to descend. Right
+    // stick X stays snap turn, so you can climb and turn at the same time.
+    if (app.fly) step(dt, { x: wish.x, y: wish.y, fly: rightY }, turn, boost);
+    else step(dt, { x: wish.x, y: wish.y, fly: 0 }, turn, boost);
   } else {
     const f = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
     const s = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
@@ -374,6 +405,28 @@ function debugApi() {
     },
     groundAt: (x, z) => app.world.groundAt(x, z, app.floorY),
     get blocked() { return app.stats.blocked; },
+
+    /** Heading the camera is actually looking along, degrees (0 = -Z, positive = left). */
+    heading() {
+      const d = app.camera.getWorldDirection(new THREE.Vector3());
+      return (Math.atan2(-d.x, -d.z) * 180) / Math.PI;
+    },
+    /**
+     * Push the thumbsticks through the real readThumbsticks() → step() path with no headset.
+     * `right` is the right stick's X axis, `left` is [x, y]; opts: `rightY` (right stick Y,
+     * forward positive), `trigger` (left index trigger held), `dt`. Call with right = 0 to
+     * release the snap-turn latch, as letting go of the stick does.
+     */
+    simulateStick(right = 0, left = [0, 0], { dt = 1 / 72, rightY = 0, trigger = false } = {}) {
+      const sources = [
+        { handedness: 'left', gamepad: { axes: [0, 0, left[0], left[1]], buttons: [{ pressed: trigger }] } },
+        { handedness: 'right', gamepad: { axes: [0, 0, right, rightY], buttons: [{ pressed: false }] } },
+      ];
+      const { wish, turn, rightY: climb, boost } = readThumbsticks(sources);
+      if (app.fly) step(dt, { x: wish.x, y: wish.y, fly: climb }, turn, boost);
+      else step(dt, { x: wish.x, y: wish.y, fly: 0 }, turn, boost);
+      return { turn, wish, climb, boost, headingDeg: this.heading(), latch: app.yawLatch };
+    },
   };
 }
 

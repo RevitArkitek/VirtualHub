@@ -94,9 +94,11 @@ self-signed certificate warning once on the headset.
 | | |
 |---|---|
 | Left stick | walk |
-| Right stick | snap turn (30°) |
+| Right stick left/right | snap turn 30° per push, in the direction you push — let the stick spring back before the next step |
 | Trigger / A | toggle fly mode |
-| Desktop | WASD, drag to look, `F` fly, `R` respawn |
+| Left trigger (hold) | fast navigation: 3× movement speed while held — walking, flying and climbing; snap turn stays 30° |
+| While flying | left stick ↑↓ forward/back, ←→ strafe — same as walking. Right stick ↑↓ climbs (push forward) / descends (pull back), ←→ still snap turns |
+| Desktop | WASD, drag to look, `F` fly, `Q`/`E` down/up, `R` respawn |
 
 ## Test it without Revit
 
