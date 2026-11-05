@@ -1,0 +1,400 @@
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { CollisionWorld } from './collision.js';
+
+const UP = new THREE.Vector3(0, 1, 0);
+const RADIUS = 0.30;       // player capsule radius, metres
+const HEAD = 1.72;         // capsule height above the floor
+const WALK = 1.65;         // m/s
+const RUN = 3.4;
+const SNAP = Math.PI / 6;  // 30 degrees
+const DEAD = 0.18;
+
+const app = {
+  ready: false,
+  scene: new THREE.Scene(),
+  rig: new THREE.Group(),
+  camera: new THREE.PerspectiveCamera(70, 1, 0.05, 400),
+  world: null,
+  manifest: null,
+  fly: false,
+  floorY: 0,
+  yawLatch: 0,
+  stats: { frames: 0, blocked: 0, tris: 0 },
+};
+
+// ---------------------------------------------------------------- renderer
+const canvas = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+// The scene is static, so the shadow map is rendered once and then frozen.
+renderer.shadowMap.autoUpdate = false;
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+
+// ---------------------------------------------------------------- lighting
+app.scene.background = new THREE.Color(0x151b22);
+app.scene.add(new THREE.HemisphereLight(0xdce9ff, 0x3a3226, 0.55));
+const ambient = new THREE.AmbientLight(0xffffff, 0.18);
+app.scene.add(ambient);
+const sun = new THREE.DirectionalLight(0xfff2e2, 1.35);
+sun.position.set(6, 12, 8);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.bias = -0.0005;
+sun.shadow.normalBias = 0.02;
+app.scene.add(sun);
+app.scene.add(sun.target);
+const fill = new THREE.DirectionalLight(0xa9c4ff, 0.35);
+fill.position.set(-8, 6, -6);
+app.scene.add(fill);
+
+app.rig.add(app.camera);
+app.camera.position.set(0, 1.6, 0);
+app.scene.add(app.rig);
+
+// ---------------------------------------------------------------- environment
+// Without an environment map, metallic and smooth materials have nothing to reflect and render
+// black. A tiny procedural sky (gradient dome + one bright panel) gives IBL for free: no asset,
+// no download, and it costs one off-screen PMREM bake at startup.
+function buildEnvironment(renderer) {
+  const envScene = new THREE.Scene();
+
+  const geo = new THREE.SphereGeometry(60, 24, 16);
+  const colors = new Float32Array(geo.attributes.position.count * 3);
+  const sky = new THREE.Color(0xcfe0f2);
+  const horizon = new THREE.Color(0xb9b4ac);
+  const ground = new THREE.Color(0x2a2620);
+  const p = geo.attributes.position;
+  const c = new THREE.Color();
+  for (let i = 0; i < p.count; i++) {
+    const t = p.getY(i) / 60;              // -1 (down) .. 1 (up)
+    if (t >= 0) c.copy(horizon).lerp(sky, Math.pow(t, 0.7));
+    else c.copy(horizon).lerp(ground, Math.pow(-t, 0.5));
+    colors[i * 3] = c.r; colors[i * 3 + 1] = c.g; colors[i * 3 + 2] = c.b;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  envScene.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    vertexColors: true, side: THREE.BackSide, toneMapped: false,
+  })));
+
+  // a bright panel standing in for a window, so specular highlights have a direction
+  const panel = new THREE.Mesh(
+    new THREE.PlaneGeometry(26, 16),
+    new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false })
+  );
+  panel.position.set(0, 14, -26);
+  panel.lookAt(0, 4, 0);
+  envScene.add(panel);
+
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  pmrem.compileEquirectangularShader();
+  const target = pmrem.fromScene(envScene, 0.02);
+  pmrem.dispose();
+  geo.dispose();
+  return target.texture;
+}
+
+app.scene.environment = buildEnvironment(renderer);
+app.scene.environmentIntensity = 0.9;
+
+// ---------------------------------------------------------------- inputs
+const keys = new Set();
+addEventListener('keydown', (e) => {
+  keys.add(e.code);
+  if (e.code === 'KeyF') toggleFly();
+  if (e.code === 'KeyR') respawn();
+});
+addEventListener('keyup', (e) => keys.delete(e.code));
+
+// desktop mouse look (so the scene is testable without a headset)
+let dragging = false, lastX = 0, lastY = 0, pitch = 0, yaw = 0;
+canvas.addEventListener('pointerdown', (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+addEventListener('pointerup', () => (dragging = false));
+addEventListener('pointermove', (e) => {
+  if (!dragging || renderer.xr.isPresenting) return;
+  yaw -= (e.clientX - lastX) * 0.0032;
+  pitch -= (e.clientY - lastY) * 0.0032;
+  pitch = Math.max(-1.45, Math.min(1.45, pitch));
+  lastX = e.clientX; lastY = e.clientY;
+  app.rig.rotation.y = yaw;
+  app.camera.rotation.set(pitch, 0, 0);
+});
+
+// ---------------------------------------------------------------- XR controllers
+const controllers = [];
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i);
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -0.6)]),
+    new THREE.LineBasicMaterial({ color: 0x9fd0ff, transparent: true, opacity: 0.55 })
+  );
+  c.add(line);
+  c.addEventListener('connected', (e) => { c.userData.handedness = e.data.handedness; });
+  c.addEventListener('selectstart', () => { if (c.userData.handedness === 'right') toggleFly(); });
+  app.rig.add(c);
+  controllers.push(c);
+}
+
+const tmpV = new THREE.Vector3();
+const tmpV2 = new THREE.Vector3();
+
+// ---------------------------------------------------------------- session
+const btn = document.getElementById('enter');
+btn.addEventListener('click', async () => {
+  try {
+    const session = await navigator.xr.requestSession('immersive-vr', {
+      optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking', 'layers'],
+    });
+    await renderer.xr.setSession(session);
+    session.addEventListener('end', () => { app.camera.position.set(0, 1.6, 0); document.body.classList.remove('presenting'); });
+    document.body.classList.add('presenting');
+  } catch (err) {
+    console.error(err);
+    document.getElementById('hint').textContent =
+      'XR session failed: ' + (err && err.message ? err.message : err);
+  }
+});
+
+function toggleFly() {
+  app.fly = !app.fly;
+  if (!app.fly && app.world) {
+    // dropping out of fly at height should land you, not leave you hovering
+    const g = app.world.groundAt(app.rig.position.x, app.rig.position.z, app.rig.position.y + 0.45, 0.45, 500);
+    if (g !== null) {
+      app.floorY = g;
+      app.rig.position.y = g;
+    }
+  }
+  flash(app.fly ? 'FLY' : 'WALK');
+}
+function respawn(opts = {}) {
+  const m = app.manifest;
+  app.rig.position.set(m.spawn[0], Math.max(0, m.spawn[1] - m.eyeHeight), m.spawn[2]);
+  app.floorY = app.rig.position.y;
+  yaw = Math.atan2(-m.spawnForward[0], -m.spawnForward[2]);
+  app.rig.rotation.y = yaw;
+  pitch = 0;
+  app.camera.rotation.set(0, 0, 0);
+  if (!opts.silent) flash('RESPAWN');
+}
+function flash(t) {
+  const el = document.getElementById('toast');
+  el.textContent = t;
+  el.classList.add('show');
+  clearTimeout(flash._t);
+  flash._t = setTimeout(() => el.classList.remove('show'), 900);
+}
+
+// ---------------------------------------------------------------- movement
+/**
+ * Applies one movement step. Kept separate from the render loop so the headless
+ * test harness can drive it deterministically.
+ */
+function step(dt, wish, turn) {
+  if (!app.world) return;
+
+  // horizontal basis from where the head is actually looking
+  const dir = app.camera.getWorldDirection(tmpV);
+  dir.y = 0;
+  if (dir.lengthSq() < 1e-6) dir.set(0, 0, -1);
+  dir.normalize();
+  const right = tmpV2.crossVectors(dir, UP).normalize();
+
+  const speed = (keys.has('ShiftLeft') || keys.has('ShiftRight')) ? RUN : WALK;
+  const dx = (dir.x * wish.y + right.x * wish.x) * speed * dt;
+  const dz = (dir.z * wish.y + right.z * wish.x) * speed * dt;
+
+  if (!app.fly) {
+    const p = app.rig.position;
+    const before = { x: p.x, z: p.z };
+    p.x += dx;
+    p.z += dz;
+    const blocked = app.world.resolve(p, RADIUS, p.y, p.y + HEAD);
+    if (blocked) app.stats.blocked++;
+
+    // keep the capsule out of walls even if the player spawned inside one
+    if (before.x === p.x && before.z === p.z && (dx || dz)) app.stats.blocked++;
+
+    // ground snapping: highest walkable slab under us within one stair riser
+    const g = app.world.groundAt(p.x, p.z, app.floorY, 0.45, 3.0);
+    if (g !== null && Math.abs(g - app.floorY) > 1e-4) {
+      app.floorY += (g - app.floorY) * Math.min(1, dt * 12);
+      p.y = app.floorY;
+    } else if (g !== null) {
+      p.y = g;
+    }
+  } else {
+    app.rig.position.x += dx;
+    app.rig.position.z += dz;
+    if (wish.fly !== 0) app.rig.position.y += wish.fly * speed * dt;
+    app.floorY = app.rig.position.y;
+  }
+
+  if (turn) snapTurn(turn * SNAP);
+}
+
+function snapTurn(angle) {
+  const head = app.camera.getWorldPosition(new THREE.Vector3());
+  const delta = head.clone().sub(app.rig.position);
+  delta.applyAxisAngle(UP, angle);
+  app.rig.position.copy(head).sub(delta);
+  app.rig.rotation.y += angle;
+  if (!renderer.xr.isPresenting) yaw = app.rig.rotation.y;
+}
+
+function readThumbsticks() {
+  let wish = { x: 0, y: 0 };
+  let turn = 0;
+  for (const src of renderer.xr.getSession()?.inputSources ?? []) {
+    const gp = src.gamepad;
+    if (!gp || !gp.axes || gp.axes.length < 4) continue;
+    const ax = gp.axes[2], ay = gp.axes[3];
+    if (Math.abs(ax) < DEAD && Math.abs(ay) < DEAD) continue;
+    if (src.handedness === 'right') {
+      // snap turn latch so one push = one 30 degree step
+      if (Math.abs(ax) > 0.7 && app.yawLatch === 0) {
+        turn = Math.sign(ax);
+        app.yawLatch = Math.sign(ax);
+      } else if (Math.abs(ax) < 0.4) {
+        app.yawLatch = 0;
+      }
+    } else {
+      wish = { x: ax, y: -ay };
+    }
+  }
+  return { wish, turn };
+}
+
+// ---------------------------------------------------------------- loop
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (renderer.xr.isPresenting) {
+    const { wish, turn } = readThumbsticks();
+    if (app.fly) step(dt, { x: wish.x, y: 0, fly: wish.y }, turn);
+    else step(dt, { x: wish.x, y: wish.y, fly: 0 }, turn);
+  } else {
+    const f = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
+    const s = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+    const fly = (keys.has('KeyE') ? 1 : 0) - (keys.has('KeyQ') ? 1 : 0);
+    step(dt, { x: s, y: f, fly }, 0);
+    app.camera.position.y = 1.6;
+  }
+  app.stats.frames++;
+  renderer.render(app.scene, app.camera);
+  updateHud();
+});
+
+let hudT = 0;
+function updateHud() {
+  if (performance.now() - hudT < 250) return;
+  hudT = performance.now();
+  const p = app.rig.position;
+  document.getElementById('hud').textContent =
+    `${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)} m` +
+    `   ${app.stats.tris.toLocaleString()} tris` +
+    (app.fly ? '   FLY' : '');
+}
+
+// ---------------------------------------------------------------- load
+async function load() {
+  const manifest = await fetch('./scene/colliders.json', { cache: 'no-store' }).then((r) => {
+    if (!r.ok) throw new Error('colliders.json: HTTP ' + r.status);
+    return r.json();
+  });
+  app.manifest = manifest;
+  app.world = new CollisionWorld(manifest.segments, manifest.surfaces, manifest.terrain);
+
+  const gltf = await new GLTFLoader().loadAsync('./scene/scene.glb');
+  let tris = 0;
+  gltf.scene.traverse((o) => {
+    if (o.isMesh) {
+      o.frustumCulled = true;
+      o.castShadow = true;
+      o.receiveShadow = true;
+      const g = o.geometry;
+      tris += (g.index ? g.index.count : g.attributes.position.count) / 3;
+      const m = o.material;
+      if (m) {
+        m.envMapIntensity = 0.8;
+        if (m.map) m.map.colorSpace = THREE.SRGBColorSpace;
+      }
+    }
+  });
+  app.stats.tris = Math.round(tris);
+  app.scene.add(gltf.scene);
+
+  // fit the single shadow map to the model, then freeze it
+  const box = new THREE.Box3().setFromObject(gltf.scene);
+  if (!box.isEmpty()) {
+    const c = box.getCenter(new THREE.Vector3());
+    const size = Math.min(box.getSize(new THREE.Vector3()).length(), 80);
+    sun.position.copy(c).add(new THREE.Vector3(size * 0.4, size * 0.75, size * 0.35));
+    sun.target.position.copy(c);
+    sun.target.updateMatrixWorld();
+    const sc = sun.shadow.camera;
+    sc.left = -size / 2; sc.right = size / 2;
+    sc.top = size / 2; sc.bottom = -size / 2;
+    sc.near = 0.5; sc.far = size * 2.5;
+    sc.updateProjectionMatrix();
+  }
+
+  respawn({ silent: true });
+  document.getElementById('loading').classList.add('gone');
+  renderer.shadowMap.needsUpdate = true;
+  app.ready = true;
+  window.__vr = debugApi();
+}
+
+// ---------------------------------------------------------------- test hooks
+function debugApi() {
+  return {
+    app,
+    get position() { return app.rig.position.clone(); },
+    setPose(x, z, yawDeg = 0, y = null) {
+      app.rig.position.set(x, y ?? app.rig.position.y, z);
+      app.floorY = app.rig.position.y;
+      yaw = (yawDeg * Math.PI) / 180;
+      app.rig.rotation.y = yaw;
+      app.camera.rotation.set(0, 0, 0);
+      pitch = 0;
+    },
+    /** Walk in a straight line for `seconds`, as the movement code would. */
+    walkWard(seconds, fwd = 1, strafe = 0, dt = 1 / 72) {
+      const n = Math.round(seconds / dt);
+      for (let i = 0; i < n; i++) step(dt, { x: strafe, y: fwd, fly: 0 }, 0);
+      return app.rig.position.clone();
+    },
+    groundAt: (x, z) => app.world.groundAt(x, z, app.floorY),
+    get blocked() { return app.stats.blocked; },
+  };
+}
+
+addEventListener('resize', () => {
+  app.camera.aspect = window.innerWidth / window.innerHeight;
+  app.camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+if (navigator.xr) {
+  navigator.xr.isSessionSupported('immersive-vr').then((ok) => {
+    document.getElementById('hint').textContent = ok
+      ? 'Headset detected — put it on and press Enter VR.'
+      : 'Browser has no WebXR device (this is expected on desktop).';
+    btn.disabled = false;
+  });
+} else {
+  document.getElementById('hint').textContent = 'WebXR not available in this browser.';
+}
+
+load().catch((e) => {
+  console.error(e);
+  document.getElementById('loading').textContent = 'Load failed: ' + e.message;
+});

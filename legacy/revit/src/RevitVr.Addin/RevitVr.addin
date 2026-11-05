@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>RevitVR</Name>
+    <Assembly>__ASSEMBLY__</Assembly>
+    <AddInId>7c1f4a2e-93b5-4d18-9f60-2a7c5e0b8d41</AddInId>
+    <FullClassName>RevitVr.Addin.App</FullClassName>
+    <VendorId>RVVR</VendorId>
+    <VendorDescription>RevitVR - walk your Revit model on a Quest 3</VendorDescription>
+  </AddIn>
+</RevitAddIns>
