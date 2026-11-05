@@ -26,15 +26,43 @@ Built and verified on this machine (Revit 2025, .NET 8, Quest path via adb):
 | Revit add-in (ribbon, export, collider harvest) | compiles against real `RevitAPI.dll` / `RevitAPIUI.dll` |
 | GLB writer | passes the official Khronos `gltf-validator` — 0 errors, 0 warnings |
 | Door cut-out geometry | 19/19 assertions on the shipped code (straight, curved and overlapping cases) |
-| Collision engine | 11/11 headless assertions incl. "walls block, doorways pass" |
-| WebXR viewer | loads, renders, walks, collides in a real browser |
-| Local server | serves viewer + scene, HTTP loopback and HTTPS LAN |
+| Minimum-area footprint fitting | 12/12 (rotated rectangles, circles, degenerate input) |
+| Collision engine | 24/24 headless assertions — walls, doorways, stairs, terrain, oriented obstacles |
+| WebXR viewer | loads, renders, walks, climbs, collides in a real browser |
+| Local server | serves viewer + scene, HTTP loopback and HTTPS LAN; certificate persisted |
 | Installer | `dist\` assembled, installed to Revit's addins folder, deployment re-checked |
 | **Export of an actual building** | **not yet run — needs a Revit session and your model** |
 
 The one thing not exercised end-to-end is harvesting geometry from a live Revit document. That
 needs Revit open with a model and a licensed session, which cannot be automated here. Everything
 downstream of it is tested.
+
+### Where this stands
+
+Verified in-session against the demo scene and a real browser: instance placement, wall and door
+colliders, stair treads, terrain interpolation, and furniture obstacles.
+
+**Awaiting one Revit export to confirm against a real model** — the numbers to check are printed
+in the export dialog, and each has a documented meaning:
+
+| Report line | What it tells you |
+|---|---|
+| `elements, instances, solids` | `instances` near zero means family instances aren't being reached |
+| `wall runs → N wall segments, M obstacle boxes` | `M` zero means the obstacle categories aren't matching your families |
+| `doors: N found, M cut` | `M < N` means some door hosts aren't resolving |
+| `surfaces, treads, terrain triangles` | zero treads/terrain means the geometry didn't produce walkable faces |
+| `light-source meshes skipped` | absent means the name heuristic missed your fixture families |
+
+### Operational gotchas
+
+- **Close Revit before running `build.ps1`.** It holds `RevitVr.Addin.dll` open and the install
+  will fail partway. The script does not force-kill Revit, by design.
+- **Windows Firewall** needs an inbound rule for `RevitVr.Server.exe` or the headset cannot reach
+  the HTTPS address. `build.ps1` adds it when run as Administrator.
+- **The LAN certificate is persisted** at `%LOCALAPPDATA%\RevitVR\cert.pfx`, so the headset only
+  accepts the warning once. Regenerate with `--new-cert`.
+- **`adb devices` must show the headset** for the one-click path. Link and casting are not adb.
+
 
 ## Install
 
