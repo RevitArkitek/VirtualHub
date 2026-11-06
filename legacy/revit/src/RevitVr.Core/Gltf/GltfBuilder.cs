@@ -40,6 +40,9 @@ public sealed class GltfBuilder
         public readonly List<float> Nrm = new();
         public readonly List<float> Uv = new();
         public readonly List<uint> Idx = new();
+
+        /// <summary>Baked occlusion, 3 floats per vertex; empty until <see cref="GltfBuilder.BakeVertexOcclusion"/>.</summary>
+        public readonly List<float> Col = new();
         public readonly List<float> Min = new() { float.MaxValue, float.MaxValue, float.MaxValue };
         public readonly List<float> Max = new() { float.MinValue, float.MinValue, float.MinValue };
     }
@@ -141,6 +144,234 @@ public sealed class GltfBuilder
         foreach (var i in indices) m.Idx.Add((uint)(baseVertex + i));
     }
 
+    /// <summary>
+    /// Bakes ambient occlusion over everything added so far and stores it as per-vertex colour.
+    ///
+    /// Runs after the geometry is assembled and before <see cref="Build"/>, because occlusion
+    /// has to be measured against the whole model — a wall darkens the floor whether or not they
+    /// ended up under the same material.
+    /// </summary>
+    public AoReport BakeVertexOcclusion(AoOptions? options = null)
+    {
+        var o = options ?? new AoOptions();
+        if (_used.Count == 0) return new AoReport(0, 0, 0, 0, 0, false, false);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var trianglesBefore = TriangleCount;
+
+        // Large triangles get subdivided first: a slab is two triangles, and shading four corners
+        // is not occlusion, it is a vignette across the whole room.
+        var subdivided = false;
+        if (o.MaxEdge > 0)
+        {
+            var budget = Math.Max(0, o.MaxTriangles - trianglesBefore);
+            foreach (var m in _used)
+            {
+                if (budget <= 0) break;
+                var added = Subdivide(m, o.MaxEdge, budget);
+                if (added > 0) subdivided = true;
+                budget -= added;
+            }
+        }
+
+        // One soup for the whole scene, so occlusion comes from every material's geometry.
+        var vertexCount = _used.Sum(m => m.Pos.Count / 3);
+        var triangleCount = _used.Sum(m => m.Idx.Count / 3);
+
+        var positions = new float[vertexCount * 3];
+        var normals = new float[vertexCount * 3];
+        var indices = new int[triangleCount * 3];
+
+        var vBase = 0;
+        var iBase = 0;
+        var offsets = new int[_used.Count];
+
+        for (var mi = 0; mi < _used.Count; mi++)
+        {
+            var m = _used[mi];
+            offsets[mi] = vBase;
+
+            m.Pos.CopyTo(positions, vBase * 3);
+            for (var i = 0; i < Math.Min(m.Nrm.Count, vertexCount * 3 - vBase * 3); i++)
+                normals[vBase * 3 + i] = m.Nrm[i];
+
+            for (var i = 0; i < m.Idx.Count; i++) indices[iBase + i] = (int)m.Idx[i] + vBase;
+
+            vBase += m.Pos.Count / 3;
+            iBase += m.Idx.Count;
+        }
+
+        var ao = new float[vertexCount];
+        VertexOcclusion.Compute(positions, normals, indices, o, ao);
+        VertexOcclusion.Smooth(ao, indices, o.SmoothingIterations, o.SmoothingStrength);
+
+        for (var mi = 0; mi < _used.Count; mi++)
+        {
+            var m = _used[mi];
+            var count = m.Pos.Count / 3;
+            m.Col.Clear();
+            m.Col.Capacity = count * 3;
+            for (var i = 0; i < count; i++)
+            {
+                var v = ao[offsets[mi] + i];
+                m.Col.Add(v); m.Col.Add(v); m.Col.Add(v);
+            }
+        }
+
+        sw.Stop();
+        return new AoReport(vertexCount, o.Rays, trianglesBefore, TriangleCount,
+                            sw.Elapsed.TotalSeconds, subdivided, true);
+    }
+
+    private readonly record struct WeldKey(int X, int Y, int Z, int NX, int NY, int NZ, int U, int V);
+
+    private struct Corner
+    {
+        public float X, Y, Z, NX, NY, NZ, U, V;
+    }
+
+    /// <summary>
+    /// Splits triangles longer than <paramref name="maxEdge"/> at their longest edge, welding
+    /// shared corners back together so subdivision does not triple the vertex count.
+    /// Returns how many triangles were added.
+    /// </summary>
+    private static long Subdivide(Mat m, float maxEdge, long budget)
+    {
+        if (m.Idx.Count < 3 || budget <= 0) return 0;
+
+        var vertexCount = m.Pos.Count / 3;
+        var hasUv = m.Uv.Count >= vertexCount * 2;
+        var maxEdgeSq = maxEdge * maxEdge;
+        var trianglesBefore = m.Idx.Count / 3;
+
+        var pos = new List<float>(m.Pos.Count * 2);
+        var nrm = new List<float>(m.Nrm.Count * 2);
+        var uv = hasUv ? new List<float>(m.Uv.Count * 2) : null;
+        var idx = new List<uint>(m.Idx.Count * 2);
+        var weld = new Dictionary<WeldKey, int>();
+
+        var emitted = 0L;
+        var limit = budget;   // triangles we may add before giving up on further splitting
+
+        int Vertex(in Corner c)
+        {
+            var key = new WeldKey(
+                (int)MathF.Round(c.X * 10000f), (int)MathF.Round(c.Y * 10000f), (int)MathF.Round(c.Z * 10000f),
+                (int)MathF.Round(c.NX * 1000f), (int)MathF.Round(c.NY * 1000f), (int)MathF.Round(c.NZ * 1000f),
+                (int)MathF.Round(c.U * 10000f), (int)MathF.Round(c.V * 10000f));
+
+            if (weld.TryGetValue(key, out var existing)) return existing;
+
+            var index = pos.Count / 3;
+            pos.Add(c.X); pos.Add(c.Y); pos.Add(c.Z);
+            nrm.Add(c.NX); nrm.Add(c.NY); nrm.Add(c.NZ);
+            if (uv is not null) { uv.Add(c.U); uv.Add(c.V); }
+            weld[key] = index;
+            return index;
+        }
+
+        void Emit(in Corner a, in Corner b, in Corner c)
+        {
+            // A zero-area triangle carries no shading and no visibility; dropping it here keeps
+            // the validator quiet and the draw slightly cheaper.
+            var ux = b.X - a.X; var uy = b.Y - a.Y; var uz = b.Z - a.Z;
+            var vx = c.X - a.X; var vy = c.Y - a.Y; var vz = c.Z - a.Z;
+            var nx = uy * vz - uz * vy;
+            var ny = uz * vx - ux * vz;
+            var nz = ux * vy - uy * vx;
+            if (nx * nx + ny * ny + nz * nz < 1e-14f) return;
+
+            var ia = Vertex(a); var ib = Vertex(b); var ic = Vertex(c);
+            if (ia == ib || ib == ic || ia == ic) return;
+
+            idx.Add((uint)ia); idx.Add((uint)ib); idx.Add((uint)ic);
+            emitted++;
+        }
+
+        Corner Lerp(in Corner a, in Corner b)
+        {
+            var r = new Corner
+            {
+                X = (a.X + b.X) * 0.5f, Y = (a.Y + b.Y) * 0.5f, Z = (a.Z + b.Z) * 0.5f,
+                NX = (a.NX + b.NX) * 0.5f, NY = (a.NY + b.NY) * 0.5f, NZ = (a.NZ + b.NZ) * 0.5f,
+                U = (a.U + b.U) * 0.5f, V = (a.V + b.V) * 0.5f,
+            };
+            var len = MathF.Sqrt(r.NX * r.NX + r.NY * r.NY + r.NZ * r.NZ);
+            if (len > 1e-6f) { r.NX /= len; r.NY /= len; r.NZ /= len; }
+            return r;
+        }
+
+        static float Sq(float x, float y, float z) => x * x + y * y + z * z;
+
+        var stack = new Stack<(Corner a, Corner b, Corner c, int depth)>(64);
+
+        for (var t = 0; t + 2 < m.Idx.Count; t += 3)
+        {
+            Corner Read(int index)
+            {
+                var i = index * 3;
+                return new Corner
+                {
+                    X = m.Pos[i], Y = m.Pos[i + 1], Z = m.Pos[i + 2],
+                    NX = i + 2 < m.Nrm.Count ? m.Nrm[i] : 0f,
+                    NY = i + 2 < m.Nrm.Count ? m.Nrm[i + 1] : 1f,
+                    NZ = i + 2 < m.Nrm.Count ? m.Nrm[i + 2] : 0f,
+                    U = hasUv ? m.Uv[index * 2] : 0f,
+                    V = hasUv ? m.Uv[index * 2 + 1] : 0f,
+                };
+            }
+
+            var root = (a: Read((int)m.Idx[t]), b: Read((int)m.Idx[t + 1]), c: Read((int)m.Idx[t + 2]), depth: 0);
+            stack.Push(root);
+
+            while (stack.Count > 0)
+            {
+                var (a, b, c, depth) = stack.Pop();
+
+                var ab = Sq(b.X - a.X, b.Y - a.Y, b.Z - a.Z);
+                var bc = Sq(c.X - b.X, c.Y - b.Y, c.Z - b.Z);
+                var ca = Sq(a.X - c.X, a.Y - c.Y, a.Z - c.Z);
+                var longest = MathF.Max(ab, MathF.Max(bc, ca));
+
+                if (longest <= maxEdgeSq || depth >= 6 || emitted - trianglesBefore >= limit)
+                {
+                    Emit(a, b, c);
+                    continue;
+                }
+
+                if (longest == ab)
+                {
+                    // Children of (a,b,c) split at m on ab: (a,m,c) and (m,b,c).
+                    var mid = Lerp(a, b);
+                    stack.Push((mid, b, c, depth + 1));
+                    stack.Push((a, mid, c, depth + 1));
+                }
+                else if (longest == bc)
+                {
+                    // Split at m on bc: (a,b,m) and (a,m,c).
+                    var mid = Lerp(b, c);
+                    stack.Push((mid, c, a, depth + 1));
+                    stack.Push((a, b, mid, depth + 1));
+                }
+                else
+                {
+                    // Split at m on ca: (a,b,m) and (b,c,m).
+                    var mid = Lerp(c, a);
+                    stack.Push((a, b, mid, depth + 1));
+                    stack.Push((b, c, mid, depth + 1));
+                }
+            }
+        }
+
+        m.Pos.Clear(); m.Pos.AddRange(pos);
+        m.Nrm.Clear(); m.Nrm.AddRange(nrm);
+        m.Uv.Clear();
+        if (uv is not null) m.Uv.AddRange(uv);
+        m.Idx.Clear(); m.Idx.AddRange(idx);
+
+        return Math.Max(0, idx.Count / 3 - trianglesBefore);
+    }
+
     /// <summary>Returns the finished GLB bytes.</summary>
     public byte[] Build()
     {
@@ -149,7 +380,7 @@ public sealed class GltfBuilder
         using var bin = new MemoryStream();
         var accessors = new List<Action<Utf8JsonWriter>>();
         var bufferViews = new List<Action<Utf8JsonWriter>>();
-        var meshAccessors = new List<(int mat, int aPos, int aNrm, int aUv, int aIdx, int aTan)>();
+        var meshAccessors = new List<(int mat, int aPos, int aNrm, int aUv, int aIdx, int aTan, int aCol)>();
 
         void Align()
         {
@@ -221,6 +452,22 @@ public sealed class GltfBuilder
                 bin.Write(ftmp);
             }
 
+            // Baked occlusion: COLOR_0 as normalised bytes, which every glTF renderer multiplies
+            // into base colour for free. Four bytes per vertex; alpha is unused.
+            var hasColor = m.Col.Count >= (m.Pos.Count / 3) * 3;
+            var colOff = -1L;
+            if (hasColor)
+            {
+                Align();
+                colOff = bin.Length;
+                for (var i = 0; i < m.Pos.Count / 3; i++)
+                {
+                    var v = m.Col[i * 3];
+                    ftmp[0] = ToByte(v); ftmp[1] = ToByte(v); ftmp[2] = ToByte(v); ftmp[3] = 255;
+                    bin.Write(ftmp);
+                }
+            }
+
             var vcount = m.Pos.Count / 3;
             var icount = m.Idx.Count;
 
@@ -245,6 +492,13 @@ public sealed class GltfBuilder
             {
                 bTan = bufferViews.Count;
                 var off = tanOff; var len = (long)vcount * 16;
+                bufferViews.Add(w => WriteView(w, off, len, 34962));
+            }
+            var bCol = -1;
+            if (hasColor)
+            {
+                bCol = bufferViews.Count;
+                var off = colOff; var len = (long)vcount * 4;
                 bufferViews.Add(w => WriteView(w, off, len, 34962));
             }
 
@@ -320,8 +574,24 @@ public sealed class GltfBuilder
                     w.WriteEndObject();
                 });
             }
+            var aCol = -1;
+            if (hasColor)
+            {
+                aCol = accessors.Count;
+                var bv = bCol; var n = vcount;
+                accessors.Add(w =>
+                {
+                    w.WriteStartObject();
+                    w.WriteNumber("bufferView", bv);
+                    w.WriteNumber("componentType", 5121);   // UNSIGNED_BYTE
+                    w.WriteBoolean("normalized", true);
+                    w.WriteNumber("count", n);
+                    w.WriteString("type", "VEC4");
+                    w.WriteEndObject();
+                });
+            }
 
-            meshAccessors.Add((_mats.IndexOf(m), aPos, aNrm, aUv, aIdx, aTan));
+            meshAccessors.Add((_mats.IndexOf(m), aPos, aNrm, aUv, aIdx, aTan, aCol));
         }
 
         // Embedded images sit in the same BIN chunk, after the geometry.
@@ -449,6 +719,7 @@ public sealed class GltfBuilder
                 w.WriteNumber("NORMAL", v.aNrm);
                 if (v.aUv >= 0) w.WriteNumber("TEXCOORD_0", v.aUv);
                 if (v.aTan >= 0) w.WriteNumber("TANGENT", v.aTan);
+                if (v.aCol >= 0) w.WriteNumber("COLOR_0", v.aCol);
                 w.WriteEndObject();
                 w.WriteNumber("indices", v.aIdx);
                 w.WriteNumber("material", i);
@@ -582,6 +853,8 @@ public sealed class GltfBuilder
 
         return result;
     }
+
+    private static byte ToByte(float v) => (byte)Math.Clamp((int)MathF.Round(Math.Clamp(v, 0f, 1f) * 255f), 0, 255);
 
     private static void WriteView(Utf8JsonWriter w, long offset, long length, int target)
     {

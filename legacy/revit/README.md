@@ -26,6 +26,7 @@ Built and verified on this machine (Revit 2025, .NET 8, Quest path via adb):
 | Revit add-in (ribbon, export, collider harvest) | compiles against real `RevitAPI.dll` / `RevitAPIUI.dll` |
 | GLB writer | passes the official Khronos `gltf-validator` — 0 errors, 0 warnings |
 | Textures (appearance-asset images, UVs, normal maps) | 46/46 headless assertions; textured GLB validates with 0 errors, 0 warnings and renders in a real browser |
+| Baked ambient occlusion (BVH raycast → `COLOR_0`) | 18/18 headless assertions; visible in the viewer at wall bases, corners and doorways |
 | Door cut-out geometry | 19/19 assertions on the shipped code (straight, curved and overlapping cases) |
 | Collider geometry (fitting, railing paths, containment) | 48/48 (rectangles, circles, degenerate input, measured heights, dropped phantom pieces, resampling, point-in-solid) |
 | Collision engine | 29/29 headless assertions — walls, doorways, stairs, terrain, oriented obstacles, railings |
@@ -54,6 +55,8 @@ likely to need extending in `TexturePathResolver.DefaultRoots()`.
 |---|---|
 | `elements, instances, solids` | `instances` near zero means family instances aren't being reached |
 | `textures: N embedded (X MB), M of K materials textured` | `M` zero means no material's appearance asset yielded an image — every surface will be flat colour |
+| `ambient occlusion: N vertices, R rays, A → B tris, T s` | `A → B` is the subdivision the bake needed; a big jump with `T` over a few seconds means the export was already heavy |
+| `texture scale: median X m per repeat (range A–B m)` | one repeat of the image per X metres of building — if this is tens of metres, a texture's unit was misread |
 | `wall runs → N wall segments, M obstacle boxes` | `M` zero means the obstacle categories aren't matching your families |
 | `railings: N found → M colliders (P height-measured, Q path-elevation, F footprint)` | `Q > 0` means those railings had no geometry to measure, so their barrier sits at the level's elevation and may be a storey off; `M` zero means railings exist but none produced a barrier |
 | `doors: N found, M cut` | `M < N` means some door hosts aren't resolving |
@@ -143,6 +146,9 @@ node tools/railcheck.mjs runtime/export
 
 # image preparation, texture-path resolution, UV projection and the textured GLB
 dotnet run --project tools/test-textures
+
+# ray casting, occlusion falloff, subdivision and the COLOR_0 the bake writes
+dotnet run --project tools/test-ao
 ```
 
 ## How this differs from Enscape
@@ -157,9 +163,10 @@ This reproduces the *interaction model*, not the pixels:
 - **Walls are solid, doors are passable.** Same, and solved more cheaply (below).
 - **Materials.** Base colour or texture, roughness, normal map per material — taken from the
   render appearance, at the real-world size it was authored at.
-- **Rendering.** One directional light with a frozen shadow map and a procedural environment
-  probe: no global illumination, no reflections, no baked light. A clean, evenly lit look rather
-  than a photoreal one — textures read properly, but an unlit corner stays as bright as a lit one.
+- **Rendering.** One directional light with a frozen shadow map, a procedural environment probe
+  and baked ambient occlusion: no global illumination, no reflections, no baked light. A clean,
+  evenly lit look rather than a photoreal one — surfaces have texture and their corners are shaded,
+  but an unlit corner stays as bright as a lit one.
 
 ## Design decisions worth knowing
 
@@ -250,9 +257,12 @@ Three things make the images usable rather than merely present:
   dominant axis. Walls, floors and ceilings — what a walkthrough actually converges on — are each
   a single plane, so the projection is exact for them, and a wall seen from its far side is not
   mirrored. Curved surfaces get a seam where the dominant axis flips, which is the standard trade.
-- **Real-world scale.** Revit stores "Size X/Y" per texture — how many feet of building one repeat
-  covers — so a brick pattern authored at 2 m repeats every 2 m in the headset, instead of
-  stretching to whatever the element happens to be. Textures with no scale fall back to 1 m.
+- **Real-world scale, in whatever unit Revit used.** Revit stores a "Size X/Y" per texture — how
+  much building one repeat of the image covers — but the value is a bare double whose unit varies
+  with the document (`AssetPropertyDistance`: *"it holds a double value; the unit varies"*), so it
+  is converted using the unit the property itself reports. Assuming feet, as the first version did,
+  turns a 300 mm metric tile into 91 m and smears one image across an entire wall. A size outside
+  anything a texture can be is rejected rather than used, and named in the export report.
 - **Images are turned into something a GLB can carry.** glTF allows PNG and JPEG only, so a TiFF
   or BMP texture is transcoded; anything over 2048 px on its longest side is scaled down (a Revit
   library is full of 4K scans, and twenty of those will not fit in a standalone headset); opaque
@@ -261,14 +271,38 @@ Three things make the images usable rather than merely present:
   material sharing one library bitmap points at a single copy.
 
 A texture that cannot be found is named in the export dialog rather than silently ignored — the
-difference between "textures do nothing" and "this file moved" is otherwise invisible.
+difference between "textures do nothing" and "this file moved" is otherwise invisible. The same
+goes for scale: `textures.json` beside the scene records, per material, the raw value Revit
+reported, the unit it claimed, and the tile size that went into the GLB, because "the textures are
+the wrong size" is a question that deserves numbers rather than a guess.
+
+**Occlusion is baked, not computed.** The scene is static, so ambient occlusion is raycast once on
+the PC and written into the GLB as per-vertex colour (`COLOR_0`), which every glTF renderer
+multiplies into base colour for free: four bytes per vertex, nothing per frame, no second texture,
+no lightmap UVs. A BVH over the merged triangles answers "does anything block this ray before
+0.8 m?" for 24 cosine-weighted directions per vertex, split across all cores.
+
+Two details make it look like shadowing rather than dirt:
+
+- **Geometry is subdivided first.** A Revit floor slab is two triangles, and interpolating four
+  corner values across a room is a vignette, not contact shading. Triangles longer than 0.4 m are
+  split at their longest edge (welding shared corners back together) until the shading has
+  somewhere to land — bounded by a triangle budget that scales with the model.
+- **The result is smoothed** over the vertex graph. 24 rays per vertex is noisy; the noise is an
+  artifact of the sample count, not of the occlusion, so two Laplacian passes remove it and leave
+  the gradient.
+
+What it cannot do is add light: there is no bounce, no colour bleeding and no light from windows,
+so a corner darkened by occlusion is still not lit the way it would be in a real room. That is the
+next tier, and it needs lightmaps, not vertices.
 
 ## What is not built yet
 
 Roughly in order of how much they'd improve it:
 
-- **Lighting.** No global illumination and no reflections, which is now the largest gap to
-  Enscape: a textured interior is lit evenly rather than by light coming through windows.
+- **Lighting.** There is baked occlusion now, but no global illumination and no reflections — which
+  is still the largest gap to Enscape: a corner is darkened correctly but never *brightened* by
+  light bouncing off a wall or coming through a window.
 - **Material fidelity.** Only the diffuse/bump maps are read. Transparency, self-illumination,
   refraction and Revit's procedural wood/marble/metal assets all fall back to flat colour.
 - **Texture alignment.** Box projection ignores the per-material rotation and mapping transform,
@@ -297,6 +331,7 @@ vr-web/                  WebXR viewer: three.js, locomotion, collision
 tools/demogen/           synthetic two-room scene in the export format, textures included
 tools/test-collision.mjs acceptance test for the collision rules
 tools/test-textures/     texture pipeline: encoder, path resolver, UVs, textured GLB
+tools/test-ao/           occlusion bake: BVH, falloff, subdivision, COLOR_0
 tools/railcheck.mjs     railing colliders vs the geometry that actually renders
 tools/gltfcheck/         Khronos gltf-validator wrapper
 tools/addincheck/        verifies the deployed add-in resolves

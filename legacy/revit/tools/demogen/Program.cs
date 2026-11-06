@@ -107,6 +107,9 @@ var lawnTris = new List<float[]>
 };
 foreach (var t in lawnTris) AddTriangle(g, grassMat, t);
 
+var ao = args.Contains("--no-ao")
+    ? new AoReport(0, 0, g.TriangleCount, g.TriangleCount, 0, false, false)
+    : g.BakeVertexOcclusion();
 var glb = g.Build();
 File.WriteAllBytes(Path.Combine(outDir, "scene.glb"), glb);
 
@@ -176,6 +179,8 @@ File.WriteAllText(Path.Combine(outDir, "colliders.json"), m.ToJson());
 Console.WriteLine($"wrote {outDir}");
 Console.WriteLine($"{glb.Length,18:N0} bytes  {g.TriangleCount,7:N0} tris  {g.MaterialCount} materials  " +
                   $"{g.TextureCount} textures ({g.TextureBytes / 1024.0:0} KB)");
+Console.WriteLine($"{ao.Vertices,18:N0} verts   ao {ao.Rays} rays  {ao.TrianglesBefore:N0} → {ao.TrianglesAfter:N0} tris  " +
+                  $"{ao.Seconds:0.00}s");
 Console.WriteLine($"  colliders.json {m.Segments.Count,10} segments, {m.Surfaces.Count} surfaces");
 
 // ---------------------------------------------------------------------------

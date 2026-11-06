@@ -14,6 +14,15 @@ public sealed record MaterialLook(
     (float R, float G, float B)? Diffuse, bool IsMetal);
 
 /// <summary>
+/// One material's texture, as the export actually resolved it: the raw value Revit reported, the
+/// unit it claimed, and the tile size in metres that went into the GLB. Written beside the scene so
+/// "the textures are the wrong size" can be answered with numbers instead of a guess.
+/// </summary>
+public sealed record MaterialTextureRow(
+    string Material, string? Image, double SizeX, double SizeY, string Unit,
+    float TileX, float TileY, float RepeatU, float RepeatV, bool ScaleClamped, string? Note);
+
+/// <summary>
 /// Pulls the image maps out of Revit's appearance assets.
 ///
 /// The data lives three levels down: Material → AppearanceAssetId → AppearanceAssetElement →
@@ -35,6 +44,10 @@ public sealed class TextureLibrary
     private readonly Dictionary<long, MaterialLook> _cache = new();
     private readonly Dictionary<string, int?> _decoded = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _unresolved = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _reported = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Every material's texture, for the report written beside the scene.</summary>
+    public List<MaterialTextureRow> Rows { get; } = new();
 
     public List<string> Warnings { get; } = new();
     public int MaterialsResolved { get; private set; }
@@ -125,27 +138,89 @@ public sealed class TextureLibrary
         var bumpAmount = Number(Find(asset, Generic.GenericBumpAmount));
         var normalScale = bumpAsset is null ? 1f : (float)Math.Clamp(bumpAmount > 0 ? bumpAmount : 1.0, 0.05, 1.0);
 
-        // Revit's "Size X/Y" is the real-world size of one repeat, in feet.
-        var scaleX = Number(Find(baseAsset, UnifiedBitmap.TextureRealWorldScaleX)) * FeetToMetres;
-        var scaleY = Number(Find(baseAsset, UnifiedBitmap.TextureRealWorldScaleY)) * FeetToMetres;
-        var offsetU = Number(Find(baseAsset, UnifiedBitmap.TextureRealWorldOffsetX)) * FeetToMetres;
-        var offsetV = Number(Find(baseAsset, UnifiedBitmap.TextureRealWorldOffsetY)) * FeetToMetres;
+        // Revit's "Size X/Y" is the real-world size of one repeat — but the number's unit varies
+        // by document, so it has to be converted by the unit the property reports, never assumed.
+        // Reading a metric value as feet put textures three hundred times out of scale.
+        var scaleX = ReadDistanceMetres(baseAsset, UnifiedBitmap.TextureRealWorldScaleX, out var rawX, out var unitX);
+        var scaleY = ReadDistanceMetres(baseAsset, UnifiedBitmap.TextureRealWorldScaleY, out var rawY, out _);
+        var offsetU = ReadDistanceMetres(baseAsset, UnifiedBitmap.TextureRealWorldOffsetX, out _, out _);
+        var offsetV = ReadDistanceMetres(baseAsset, UnifiedBitmap.TextureRealWorldOffsetY, out _, out _);
 
         var repeatU = Number(Find(baseAsset, UnifiedBitmap.TextureURepeat));
         var repeatV = Number(Find(baseAsset, UnifiedBitmap.TextureVRepeat));
         if (repeatU > 1) scaleX /= repeatU;
         if (repeatV > 1) scaleY /= repeatV;
 
-        // No usable scale in the asset: 1 m per repeat keeps the pattern architectural rather
-        // than smeared to a single image across a whole wall.
-        if (scaleX <= 1e-4) scaleX = 1.0;
-        if (scaleY <= 1e-4) scaleY = scaleX;
+        // Second line of defence: a size that no texture has means the unit is still wrong.
+        var tileX = TextureScale.Sanitise(scaleX, out var clampedX);
+        var clampedY = clampedX;
+        var tileY = scaleY > 1e-4 ? TextureScale.Sanitise(scaleY, out clampedY) : tileX;
+
+        var note = clampedX || clampedY
+            ? $"size {rawX:0.###} {unitX} is not a believable texture repeat; using {tileX:0.##} m"
+            : null;
+
+        if (note is not null && _reported.Add(material.Name ?? "material"))
+            Warnings.Add($"Texture scale on \"{material.Name}\" was unusable: {note}");
 
         MaterialsResolved++;
+        Rows.Add(new MaterialTextureRow(
+            material.Name ?? "material",
+            baseImage is null ? null : "embedded",
+            rawX, rawY, unitX,
+            tileX, (float)tileY, (float)repeatU, (float)repeatV, clampedX || clampedY, note));
+
         return new MaterialLook(
             baseImage, normalImage, normalScale,
-            (float)scaleX, (float)scaleY, (float)offsetU, (float)offsetV,
+            tileX, (float)tileY, (float)offsetU, (float)offsetV,
             diffuseColor, isMetal);
+    }
+
+    /// <summary>
+    /// Reads a distance property as metres. Revit documents <c>AssetPropertyDistance</c> as
+    /// "holds a double value; the unit varies", with <c>GetUnitTypeId()</c> naming the unit — so
+    /// that is what is used, and a value with no unit falls back to Revit's internal feet.
+    /// </summary>
+    private static double ReadDistanceMetres(Asset? asset, string propertyName,
+                                             out double raw, out string unitName)
+    {
+        raw = 0;
+        unitName = "";
+
+        var property = Find(asset, propertyName);
+        if (property is null) return 0;
+
+        try
+        {
+            switch (property)
+            {
+                case AssetPropertyDistance distance:
+                {
+                    raw = distance.Value;
+                    var unit = distance.GetUnitTypeId();
+                    if (unit is not null && !unit.Empty())
+                    {
+                        try { unitName = LabelUtils.GetLabelForUnit(unit); } catch { unitName = "?"; }
+                        return UnitUtils.ConvertToInternalUnits(raw, unit) * FeetToMetres;
+                    }
+                    unitName = "ft";
+                    return raw * FeetToMetres;
+                }
+                case AssetPropertyDouble d:
+                    raw = d.Value; unitName = "ft";
+                    return raw * FeetToMetres;
+                case AssetPropertyFloat f:
+                    raw = f.Value; unitName = "ft";
+                    return raw * FeetToMetres;
+                default:
+                    return 0;
+            }
+        }
+        catch
+        {
+            // A property that will not read is a property we do not have.
+            return 0;
+        }
     }
 
     /// <summary>An asset colour is 0..1 RGBA in Revit's asset space.</summary>

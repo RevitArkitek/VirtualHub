@@ -98,6 +98,17 @@ public static class ExportJob
         var harvest = new GeometryExporter(doc, builder);
         harvest.Export(view);
 
+        // Baked occlusion runs on the PC so the headset pays nothing per frame. Both settings
+        // scale with the model: occlusion is a low-frequency signal, and a building with a million
+        // triangles does not need 24 rays per vertex or half-metre subdivision.
+        var tris = builder.TriangleCount;
+        var aoOptions = new AoOptions
+        {
+            Rays = tris > 750_000 ? 12 : tris > 300_000 ? 16 : 24,
+            MaxEdge = tris > 1_000_000 ? 0f : tris > 300_000 ? 0.8f : 0.4f,
+        };
+        var ao = builder.BakeVertexOcclusion(aoOptions);
+
         var glb = builder.Build();
         File.WriteAllBytes(glbPath, glb);
 
@@ -116,10 +127,17 @@ public static class ExportJob
         File.WriteAllText(jsonPath, manifest.ToJson());
 
         // Per-railing detail beside the scene, so a railing that misbehaves in the headset can be
-        // traced to its ElementId instead of guessed at from coordinates.
+        // traced to an ElementId instead of guessed at from coordinates.
         File.WriteAllText(
             Path.Combine(dir, "railings.json"),
             System.Text.Json.JsonSerializer.Serialize(stats.Railings, SceneManifest.JsonOptions));
+
+        // Per-material texture scale beside the scene: the raw value Revit gave, the unit it
+        // claimed, and the tile size that went into the GLB. A texture that is out of scale is
+        // almost always a unit that was read wrong, and this is what shows it.
+        File.WriteAllText(
+            Path.Combine(dir, "textures.json"),
+            System.Text.Json.JsonSerializer.Serialize(harvest.Textures.Rows, SceneManifest.JsonOptions));
 
         sw.Stop();
 
@@ -129,6 +147,8 @@ public static class ExportJob
             $"{stats.Openings} door openings cut, {stats.RailingBoxes} railing colliders.\n" +
             $"textures: {builder.TextureCount} embedded ({builder.TextureBytes / 1048576.0:0.0} MB), " +
             $"{builder.TexturedMaterials} of {builder.MaterialCount} materials textured.\n" +
+            $"ambient occlusion: {ao.Vertices:N0} vertices, {ao.Rays} rays, " +
+            $"{ao.TrianglesBefore:N0} → {ao.TrianglesAfter:N0} tris, {ao.Seconds:0.0}s.\n" +
             $"{harvest.Elements:N0} elements, {harvest.Instances:N0} instances, {harvest.Solids:N0} solids." +
             (harvest.LightSourcesSkipped > 0
                 ? $"\n{harvest.LightSourcesSkipped} light-source meshes skipped."
@@ -147,6 +167,26 @@ public static class ExportJob
                            : "");
         }
 
+        // An out-of-scale texture is almost always a unit read the wrong way, so say what came out
+        // rather than leaving it to be noticed in the headset.
+        var scales = harvest.Textures.Rows.Where(r => !r.ScaleClamped).Select(r => r.TileX)
+                          .OrderBy(v => v).ToList();
+        var clampedCount = harvest.Textures.Rows.Count(r => r.ScaleClamped);
+
+        if (scales.Count > 0)
+        {
+            message += $"\ntexture scale: median {scales[scales.Count / 2]:0.##} m per repeat " +
+                       $"(range {scales[0]:0.##}–{scales[^1]:0.##} m), full detail in textures.json.";
+        }
+
+        if (clampedCount > 0)
+        {
+            message += $"\n\nWARNING: {clampedCount} texture sizes were outside anything a texture could be " +
+                       $"({TextureScale.MinMetres:0.##}–{TextureScale.MaxMetres:0} m per repeat) and were " +
+                       "replaced with 1 m. This is a unit problem, not a big pattern — textures.json " +
+                       "has the raw value and the unit Revit reported for each material.";
+        }
+
         // A zero here is the difference between "walkthrough" and "sealed box", so say it loudly.
         if (stats.DoorsFound > 0 && stats.Openings == 0)
             message += $"\n\nWARNING: {stats.DoorsFound} doors found, none matched a wall. " +
@@ -159,7 +199,8 @@ public static class ExportJob
 
         if (builder.TriangleCount > 750_000)
             message += "\n\nNote: this is a heavy scene for a standalone headset. Cropping the 3D view " +
-                       "to one floor gives a much smoother framerate.";
+                       "to one floor gives a much smoother framerate, and makes the baked " +
+                       "occlusion sharper too.";
 
         var outcome = new ExportOutcome(
             true, dir, message,

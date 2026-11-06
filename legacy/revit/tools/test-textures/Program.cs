@@ -184,6 +184,40 @@ float RunZeroTile()
     return u[0];
 }
 
+// ---------------------------------------------------------------- texture scale guard
+Console.WriteLine("texture scale");
+
+// A 300 mm tile on a 3 m wall is ten repeats — the case a document authored in millimetres produces.
+var mmUv = new List<float>();
+UvProjection.BoxProject(new List<float> { 3, 0, 0 }, new List<float> { 0, 0, 1 }, 0.3f, 0.3f, 0f, 0f, mmUv);
+Check("a 300 mm tile repeats ten times across 3 m", Near(mmUv[0], 10f), $"{mmUv[0]}");
+
+// The failure this guards: that same value read as feet becomes 91 m and the texture disappears.
+var badUv = new List<float>();
+UvProjection.BoxProject(new List<float> { 3, 0, 0 }, new List<float> { 0, 0, 1 }, 91.44f, 91.44f, 0f, 0f, badUv);
+Check("a 91 m tile would smear one image over the wall", Near(badUv[0], 0.0328f), $"{badUv[0]}");
+
+var plausible = TextureScale.Sanitise(0.3, out var clampedPlausible);
+Check("a believable size is kept", Near(plausible, 0.3f) && !clampedPlausible, $"{plausible}");
+
+var tooBig = TextureScale.Sanitise(91.44, out var clampedBig);
+Check("a millimetre value read as feet is rejected",
+    Near(tooBig, TextureScale.FallbackMetres) && clampedBig, $"{tooBig}");
+
+var tooSmall = TextureScale.Sanitise(0.0008, out var clampedSmall);
+Check("a sub-millimetre size is rejected", Near(tooSmall, TextureScale.FallbackMetres) && clampedSmall,
+    $"{tooSmall}");
+
+Check("a zero size is rejected", TextureScale.Sanitise(0, out var clampedZero) > 0 && clampedZero);
+Check("a negative size is rejected", TextureScale.Sanitise(-3, out var clampedNeg) > 0 && clampedNeg);
+Check("NaN is rejected", TextureScale.Sanitise(double.NaN, out var clampedNan) > 0 && clampedNan);
+
+var minEdge = TextureScale.Sanitise(TextureScale.MinMetres, out var clampedMin);
+var maxEdge = TextureScale.Sanitise(TextureScale.MaxMetres, out var clampedMax);
+Check("the edges of the believable range are kept",
+    !clampedMin && !clampedMax && Near(minEdge, TextureScale.MinMetres),
+    $"{minEdge} / {maxEdge}");
+
 // ---------------------------------------------------------------- GLB structure
 Console.WriteLine("GLB output");
 
