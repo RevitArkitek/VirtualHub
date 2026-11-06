@@ -15,5 +15,6 @@
   <ItemGroup>
     <Compile Include="..\..\src\RevitVr.Addin\Export\TextureEncoder.cs" Link="TextureEncoder.cs" />
     <Compile Include="..\..\src\RevitVr.Addin\Export\TexturePathResolver.cs" Link="TexturePathResolver.cs" />
+    <Compile Include="..\..\src\RevitVr.Addin\Export\ExportSettings.cs" Link="ExportSettings.cs" />
   </ItemGroup>
 </Project>

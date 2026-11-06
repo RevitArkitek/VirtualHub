@@ -49,7 +49,16 @@ AxisBox(g, floorMat, -0.1f, -0.1f, -0.1f, L + 0.1f, 0f, D + 0.1f);
 AxisBox(g, rugMat, 0.6f, 0.001f, 0.7f, 3.2f, 0.02f, 3.0f);
 
 // --- walls ------------------------------------------------------------------
-Wall(g, wallMat, -0.1f, 0f, L + 0.1f, 0f);                     // north
+// The north wall carries a window: an opening 2.0 x 1.2 m, so light can enter a closed room and
+// a bake has something to do. Everything else stays as it was.
+const float WinX0 = 1.5f, WinX1 = 3.5f, WinSill = 1.0f, WinHead = 2.2f;
+Wall(g, wallMat, -0.1f, 0f, WinX0, 0f);                        // north, west of the window
+Wall(g, wallMat, WinX1, 0f, L + 0.1f, 0f);                     // north, east of the window
+AxisBox(g, wallMat, WinX0, 0f, -0.1f, WinX1, WinSill, 0.1f);   // sill
+AxisBox(g, wallMat, WinX0, WinHead, -0.1f, WinX1, H, 0.1f);    // head
+
+// A ceiling over room 1: without it the room is open to the sky and there is nothing to bounce.
+AxisBox(g, wallMat, -0.1f, H, -0.1f, W, H + 0.2f, D + 0.1f);
 Wall(g, wallMat, -0.1f, D, Sx0, D);                            // south, west of the door
 Wall(g, wallMat, Sx1, D, L + 0.1f, D);                         // south, east of the door
 AxisBox(g, wallMat, Sx0, DoorY, D - T / 2, Sx1, H, D + T / 2); // lintel over the exterior door
@@ -107,9 +116,17 @@ var lawnTris = new List<float[]>
 };
 foreach (var t in lawnTris) AddTriangle(g, grassMat, t);
 
-var ao = args.Contains("--no-ao")
+// Default: occlusion only (the shipping path). --bake-preview additionally bakes sky + bounce
+// light into the same channel, which is what the lightmap spike measured — see
+// spikes/001-baked-indirect/README.md for why it is a preview and not the shipping look.
+var bakePreview = args.Contains("--bake-preview");
+var baked = !args.Contains("--no-ao");
+
+var ao = !baked
     ? new AoReport(0, 0, g.TriangleCount, g.TriangleCount, 0, false, false)
-    : g.BakeVertexOcclusion();
+    : bakePreview
+        ? g.BakeIndirectLight(new IndirectOptions(), maxEdge: 0.4f)
+        : g.BakeVertexOcclusion();
 var glb = g.Build();
 File.WriteAllBytes(Path.Combine(outDir, "scene.glb"), glb);
 
@@ -123,7 +140,8 @@ var m = new SceneManifest
     EyeHeight = 1.6f,
     ModelMinY = 0f,
     ModelMaxY = H,
-    TriangleCount = g.TriangleCount
+    TriangleCount = g.TriangleCount,
+    BakedLight = bakePreview
 };
 
 void Seg(float x1, float z1, float x2, float z2, float y0 = 0f, float y1 = H)

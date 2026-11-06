@@ -59,6 +59,14 @@ public sealed class SceneManifest
     public float ModelMinY { get; set; }
     public float ModelMaxY { get; set; }
     public int TriangleCount { get; set; }
+
+    /// <summary>
+    /// True when the geometry's vertex colours carry baked light rather than just occlusion. The
+    /// viewer dims its ambient and hemisphere fill in that case, because the baked term now
+    /// provides them and counting both would double the room's brightness.
+    /// </summary>
+    public bool BakedLight { get; set; }
+
     public List<WallSegment> Segments { get; set; } = new();
     public List<WalkSurface> Surfaces { get; set; } = new();
 

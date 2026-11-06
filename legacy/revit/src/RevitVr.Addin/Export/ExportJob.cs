@@ -98,16 +98,22 @@ public static class ExportJob
         var harvest = new GeometryExporter(doc, builder);
         harvest.Export(view);
 
-        // Baked occlusion runs on the PC so the headset pays nothing per frame. Both settings
-        // scale with the model: occlusion is a low-frequency signal, and a building with a million
-        // triangles does not need 24 rays per vertex or half-metre subdivision.
-        var tris = builder.TriangleCount;
-        var aoOptions = new AoOptions
+        // Baked occlusion subdivides large triangles and shades per vertex, so it changes the mesh.
+        // It is off by default: the honest baseline is the model as Revit exports it, and it can be
+        // switched on in settings.ini once the geometry itself looks right.
+        var settings = ExportSettings.Load();
+
+        AoReport? ao = null;
+        if (settings.BakeOcclusion)
         {
-            Rays = tris > 750_000 ? 12 : tris > 300_000 ? 16 : 24,
-            MaxEdge = tris > 1_000_000 ? 0f : tris > 300_000 ? 0.8f : 0.4f,
-        };
-        var ao = builder.BakeVertexOcclusion(aoOptions);
+            var tris = builder.TriangleCount;
+            var aoOptions = new AoOptions
+            {
+                Rays = tris > 750_000 ? 16 : tris > 300_000 ? 24 : settings.Rays,
+                MaxEdge = tris > 1_000_000 ? 0f : tris > 300_000 ? 1.0f : settings.SubdivisionMetres,
+            };
+            ao = builder.BakeVertexOcclusion(aoOptions);
+        }
 
         var glb = builder.Build();
         File.WriteAllBytes(glbPath, glb);
@@ -147,8 +153,10 @@ public static class ExportJob
             $"{stats.Openings} door openings cut, {stats.RailingBoxes} railing colliders.\n" +
             $"textures: {builder.TextureCount} embedded ({builder.TextureBytes / 1048576.0:0.0} MB), " +
             $"{builder.TexturedMaterials} of {builder.MaterialCount} materials textured.\n" +
-            $"ambient occlusion: {ao.Vertices:N0} vertices, {ao.Rays} rays, " +
-            $"{ao.TrianglesBefore:N0} → {ao.TrianglesAfter:N0} tris, {ao.Seconds:0.0}s.\n" +
+            (ao is null
+                ? "ambient occlusion: off (settings.ini) — geometry exported as Revit produced it.\n"
+                : $"ambient occlusion: {ao.Vertices:N0} vertices, {ao.Rays} rays, " +
+                  $"{ao.TrianglesBefore:N0} → {ao.TrianglesAfter:N0} tris, {ao.Seconds:0.0}s.\n") +
             $"{harvest.Elements:N0} elements, {harvest.Instances:N0} instances, {harvest.Solids:N0} solids." +
             (harvest.LightSourcesSkipped > 0
                 ? $"\n{harvest.LightSourcesSkipped} light-source meshes skipped."

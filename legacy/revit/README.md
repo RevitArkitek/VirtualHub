@@ -55,7 +55,7 @@ likely to need extending in `TexturePathResolver.DefaultRoots()`.
 |---|---|
 | `elements, instances, solids` | `instances` near zero means family instances aren't being reached |
 | `textures: N embedded (X MB), M of K materials textured` | `M` zero means no material's appearance asset yielded an image — every surface will be flat colour |
-| `ambient occlusion: N vertices, R rays, A → B tris, T s` | `A → B` is the subdivision the bake needed; a big jump with `T` over a few seconds means the export was already heavy |
+| `ambient occlusion: N vertices, R rays, A → B tris, T s` | `A → B` is the subdivision the bake needed; a big jump with `T` over a few seconds means the export was already heavy. The line reads `off (settings.ini)` when baking is disabled |
 | `texture scale: median X m per repeat (range A–B m)` | one repeat of the image per X metres of building — if this is tens of metres, a texture's unit was misread |
 | `wall runs → N wall segments, M obstacle boxes` | `M` zero means the obstacle categories aren't matching your families |
 | `railings: N found → M colliders (P height-measured, Q path-elevation, F footprint)` | `Q > 0` means those railings had no geometry to measure, so their barrier sits at the level's elevation and may be a storey off; `M` zero means railings exist but none produced a barrier |
@@ -66,6 +66,9 @@ likely to need extending in `TexturePathResolver.DefaultRoots()`.
 
 ### Operational gotchas
 
+- **`%LOCALAPPDATA%\RevitVR\settings.ini`** decides whether the export bakes occlusion (off by
+  default), how far it subdivides, and how many rays it casts. It is written on the first export
+  with comments explaining each option; edit it and export again, no restart needed.
 - **Close Revit before running `build.ps1`.** It holds `RevitVr.Addin.dll` open and the install
   will fail partway. The script does not force-kill Revit, by design.
 - **Windows Firewall** needs an inbound rule for `RevitVr.Server.exe` or the headset cannot reach
@@ -119,7 +122,9 @@ dotnet run --project tools/demogen -- runtime/export      # two rooms, a doorway
 dotnet run --project src/RevitVr.Server -- --app vr-web --scene runtime/export --port 8765
 ```
 
-Open <http://127.0.0.1:8765/> and walk into the doorway.
+Open <http://127.0.0.1:8765/> and walk into the doorway. One room is closed, with a ceiling and a
+window — useful for judging lighting, and it is the room the lightmap spike was measured in
+(`--bake-preview` bakes the spike's indirect light into the same scene).
 
 ## Verification
 
@@ -280,17 +285,32 @@ the wrong size" is a question that deserves numbers rather than a guess.
 the PC and written into the GLB as per-vertex colour (`COLOR_0`), which every glTF renderer
 multiplies into base colour for free: four bytes per vertex, nothing per frame, no second texture,
 no lightmap UVs. A BVH over the merged triangles answers "does anything block this ray before
-0.8 m?" for 24 cosine-weighted directions per vertex, split across all cores.
+0.8 m?" for 48 cosine-weighted directions per vertex, split across all cores.
+
+It is **off by default**, because it changes the mesh: it subdivides large triangles so the shading
+has somewhere to land, which is visible geometry if you are checking your model rather than walking
+it. Turn it on in `%LOCALAPPDATA%\RevitVR\settings.ini` (written on first export, with comments),
+where the subdivision size and ray count live too.
 
 Two details make it look like shadowing rather than dirt:
 
 - **Geometry is subdivided first.** A Revit floor slab is two triangles, and interpolating four
-  corner values across a room is a vignette, not contact shading. Triangles longer than 0.4 m are
+  corner values across a room is a vignette, not contact shading. Triangles longer than 0.6 m are
   split at their longest edge (welding shared corners back together) until the shading has
   somewhere to land — bounded by a triangle budget that scales with the model.
-- **The result is smoothed** over the vertex graph. 24 rays per vertex is noisy; the noise is an
-  artifact of the sample count, not of the occlusion, so two Laplacian passes remove it and leave
-  the gradient.
+- **The result is smoothed** over the vertex graph. A finite ray count is noisy per vertex, and
+  noise interpolated across a triangle shows up as visible facets on a flat wall — which is exactly
+  how the first version looked. Eight passes at 48 rays leave the gradient and remove the noise.
+
+That smoothing is a trade, not a free win: it also softens the contact darkening, because the
+signal and the noise live at the same scale. The defaults lean toward artifact-free, since a wall
+covered in visible triangles reads as broken in a way that slightly softer corner shading does not.
+
+**It is off by default for a reason.** On a real building — large flat walls, few vertices per
+face — the bake was reported back as "triangles on the walls", and it made the export noticeably
+slower. Both are inherent to shading a big plane from its vertices: more subdivision means more
+triangles, less subdivision means more banding, and either way it is a mesh change. The fix is not
+a better tuning of this bake but storing light in a lightmap, which is the work the spike scoped.
 
 What it cannot do is add light: there is no bounce, no colour bleeding and no light from windows,
 so a corner darkened by occlusion is still not lit the way it would be in a real room. That is the
@@ -321,6 +341,22 @@ Roughly in order of how much they'd improve it:
   walkthrough, no annotation.
 - **Hands / teleport.** Controllers are ray lines only; no arc teleport, no hand tracking.
 
+## Spikes
+
+`spikes/` holds throwaway experiments that decided what to build next.
+
+**001 — baked indirect light.** Baked sky visibility plus three diffuse bounces per vertex to find
+out whether global illumination is what the look is missing, without building an unwrapper first.
+Verdict: the *lighting* is the missing piece, the *storage* is not. Per-vertex colour multiplies
+direct sun as well as ambient, so it cannot carry baked light without either double-darkening the
+sun or switching the sun off; it is also too coarse to hold a window's beam, and it seams where
+elements' vertices do not align. The real build is a lightmap in three's `lightMap` slot — which is
+indirect-only and therefore composes with the real-time sun — with a `TEXCOORD_1` atlas, a sidecar
+beside the scene, and a budget of about a minute per room at 1024² from the measured throughput.
+Details, numbers and the recommendation are in
+[`spikes/001-baked-indirect/README.md`](spikes/001-baked-indirect/README.md); the shipped default is
+still occlusion only.
+
 ## Layout
 
 ```
@@ -336,6 +372,7 @@ tools/railcheck.mjs     railing colliders vs the geometry that actually renders
 tools/gltfcheck/         Khronos gltf-validator wrapper
 tools/addincheck/        verifies the deployed add-in resolves
 tools/mkicon/            draws the ribbon icons
+spikes/                  throwaway experiments that decided what to build next
 ```
 
 ## Troubleshooting

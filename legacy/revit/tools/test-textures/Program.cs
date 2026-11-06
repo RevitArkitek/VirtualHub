@@ -218,6 +218,39 @@ Check("the edges of the believable range are kept",
     !clampedMin && !clampedMax && Near(minEdge, TextureScale.MinMetres),
     $"{minEdge} / {maxEdge}");
 
+// ---------------------------------------------------------------- export settings
+Console.WriteLine("settings");
+
+// The file the user edits to turn baked occlusion back on. It writes itself with a default on
+// first run, and a broken file must never stop an export. The real file is saved and put back:
+// a test must not eat somebody's settings.
+var settingsPath = ExportSettings.FilePath;
+var savedSettings = File.Exists(settingsPath) ? File.ReadAllText(settingsPath) : null;
+if (savedSettings is not null) File.Delete(settingsPath);
+
+var defaults = ExportSettings.Load();
+Check("a settings file is written on first run", File.Exists(settingsPath));
+Check("occlusion is off by default", !defaults.BakeOcclusion, defaults.BakeOcclusion.ToString());
+Check("the default file explains what it does", File.ReadAllText(settingsPath).Contains("bakeOcclusion"));
+
+File.WriteAllText(settingsPath, "bakeOcclusion = yes\nsubdivisionMetres = 0.35\nrays = 64\n");
+var enabled = ExportSettings.Load();
+Check("occlusion can be switched on", enabled.BakeOcclusion);
+Check("subdivision can be tuned", Math.Abs(enabled.SubdivisionMetres - 0.35f) < 1e-6, $"{enabled.SubdivisionMetres}");
+Check("ray count can be tuned", enabled.Rays == 64, $"{enabled.Rays}");
+
+File.WriteAllText(settingsPath, "bakeOcclusion = true\nrays = 999999\nsubdivisionMetres = 40\n");
+var clamped = ExportSettings.Load();
+Check("absurd values are clamped", clamped.Rays <= 256 && clamped.SubdivisionMetres <= 5f,
+    $"rays={clamped.Rays} sub={clamped.SubdivisionMetres}");
+
+File.WriteAllText(settingsPath, "this is not = = a settings file\n\x00garbage");
+var broken = ExportSettings.Load();
+Check("a broken file falls back to defaults", !broken.BakeOcclusion && broken.Rays > 0);
+
+if (savedSettings is not null) File.WriteAllText(settingsPath, savedSettings);
+else File.Delete(settingsPath);
+
 // ---------------------------------------------------------------- GLB structure
 Console.WriteLine("GLB output");
 

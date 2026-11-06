@@ -159,32 +159,88 @@ public sealed class GltfBuilder
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var trianglesBefore = TriangleCount;
 
-        // Large triangles get subdivided first: a slab is two triangles, and shading four corners
-        // is not occlusion, it is a vignette across the whole room.
+        var subdivided = SubdivideForShading(o.MaxEdge, o.MaxTriangles);
+
+        AssembleSoup(out var positions, out var normals, out var indices, out var offsets, out _);
+        var vertexCount = positions.Length / 3;
+
+        var ao = new float[vertexCount];
+        VertexOcclusion.Compute(positions, normals, indices, o, ao);
+        VertexOcclusion.Smooth(ao, indices, o.SmoothingIterations, o.SmoothingStrength);
+        WriteVertexColors(ao, offsets);
+
+        sw.Stop();
+        return new AoReport(vertexCount, o.Rays, trianglesBefore, TriangleCount,
+                            sw.Elapsed.TotalSeconds, subdivided, true);
+    }
+
+    /// <summary>
+    /// Bakes sky visibility plus one diffuse bounce into the same per-vertex colour, instead of
+    /// occlusion. Same storage, same cost on the headset — but the shading can now *add* light,
+    /// which occlusion alone never can.
+    /// </summary>
+    public AoReport BakeIndirectLight(IndirectOptions? options = null, float maxEdge = 0.4f,
+                                      long maxTriangles = 3_000_000)
+    {
+        var o = options ?? new IndirectOptions();
+        if (_used.Count == 0) return new AoReport(0, 0, 0, 0, 0, false, false);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var trianglesBefore = TriangleCount;
+
+        var subdivided = SubdivideForShading(maxEdge, maxTriangles);
+
+        AssembleSoup(out var positions, out var normals, out var indices, out var offsets, out var albedo);
+        var vertexCount = positions.Length / 3;
+
+        var shade = new float[vertexCount];
+        IndirectLight.Compute(positions, normals, indices, albedo, o, shade);
+        VertexOcclusion.Smooth(shade, indices, 2, 0.5f);
+        WriteVertexColors(shade, offsets);
+
+        sw.Stop();
+        return new AoReport(vertexCount, o.Rays, trianglesBefore, TriangleCount,
+                            sw.Elapsed.TotalSeconds, subdivided, true);
+    }
+
+    /// <summary>Subdivides every material until shading has somewhere to land.</summary>
+    private bool SubdivideForShading(float maxEdge, long maxTriangles)
+    {
+        if (maxEdge <= 0) return false;
+
         var subdivided = false;
-        if (o.MaxEdge > 0)
+        var budget = Math.Max(0, maxTriangles - TriangleCount);
+
+        foreach (var m in _used)
         {
-            var budget = Math.Max(0, o.MaxTriangles - trianglesBefore);
-            foreach (var m in _used)
-            {
-                if (budget <= 0) break;
-                var added = Subdivide(m, o.MaxEdge, budget);
-                if (added > 0) subdivided = true;
-                budget -= added;
-            }
+            if (budget <= 0) break;
+            var added = Subdivide(m, maxEdge, budget);
+            if (added > 0) subdivided = true;
+            budget -= added;
         }
 
-        // One soup for the whole scene, so occlusion comes from every material's geometry.
+        return subdivided;
+    }
+
+    /// <summary>
+    /// Concatenates every material into one triangle soup. Shading has to be measured against the
+    /// whole model — a wall darkens the floor whether or not they share a material — and the
+    /// per-triangle albedo is what bounce light needs to know what it is reflecting off.
+    /// </summary>
+    private void AssembleSoup(out float[] positions, out float[] normals, out int[] indices,
+                              out int[] offsets, out float[] albedo)
+    {
         var vertexCount = _used.Sum(m => m.Pos.Count / 3);
         var triangleCount = _used.Sum(m => m.Idx.Count / 3);
 
-        var positions = new float[vertexCount * 3];
-        var normals = new float[vertexCount * 3];
-        var indices = new int[triangleCount * 3];
+        positions = new float[vertexCount * 3];
+        normals = new float[vertexCount * 3];
+        indices = new int[triangleCount * 3];
+        albedo = new float[triangleCount * 3];
+        offsets = new int[_used.Count];
 
         var vBase = 0;
         var iBase = 0;
-        var offsets = new int[_used.Count];
 
         for (var mi = 0; mi < _used.Count; mi++)
         {
@@ -192,19 +248,30 @@ public sealed class GltfBuilder
             offsets[mi] = vBase;
 
             m.Pos.CopyTo(positions, vBase * 3);
-            for (var i = 0; i < Math.Min(m.Nrm.Count, vertexCount * 3 - vBase * 3); i++)
+            for (var i = 0; i < Math.Min(m.Nrm.Count, m.Pos.Count); i++)
                 normals[vBase * 3 + i] = m.Nrm[i];
 
             for (var i = 0; i < m.Idx.Count; i++) indices[iBase + i] = (int)m.Idx[i] + vBase;
 
+            // A textured material stores white as its factor because the image carries the colour,
+            // so bouncing off it needs a stand-in mid-grey rather than a mirror.
+            var (ar, ag, ab) = m.BaseTexture >= 0 || m.NormalTexture >= 0
+                ? (0.55f, 0.55f, 0.55f)
+                : (m.R, m.G, m.B);
+
+            for (var t = 0; t < m.Idx.Count / 3; t++)
+            {
+                var at = (iBase / 3 + t) * 3;
+                albedo[at] = ar; albedo[at + 1] = ag; albedo[at + 2] = ab;
+            }
+
             vBase += m.Pos.Count / 3;
             iBase += m.Idx.Count;
         }
+    }
 
-        var ao = new float[vertexCount];
-        VertexOcclusion.Compute(positions, normals, indices, o, ao);
-        VertexOcclusion.Smooth(ao, indices, o.SmoothingIterations, o.SmoothingStrength);
-
+    private void WriteVertexColors(float[] values, int[] offsets)
+    {
         for (var mi = 0; mi < _used.Count; mi++)
         {
             var m = _used[mi];
@@ -213,14 +280,10 @@ public sealed class GltfBuilder
             m.Col.Capacity = count * 3;
             for (var i = 0; i < count; i++)
             {
-                var v = ao[offsets[mi] + i];
+                var v = values[offsets[mi] + i];
                 m.Col.Add(v); m.Col.Add(v); m.Col.Add(v);
             }
         }
-
-        sw.Stop();
-        return new AoReport(vertexCount, o.Rays, trianglesBefore, TriangleCount,
-                            sw.Elapsed.TotalSeconds, subdivided, true);
     }
 
     private readonly record struct WeldKey(int X, int Y, int Z, int NX, int NY, int NZ, int U, int V);

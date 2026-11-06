@@ -4,7 +4,7 @@ namespace RevitVr.Core.Gltf;
 public sealed record AoOptions
 {
     /// <summary>Hemisphere samples per vertex. 24 is smooth enough at 8-bit precision.</summary>
-    public int Rays { get; init; } = 24;
+    public int Rays { get; init; } = 48;
 
     /// <summary>How far a ray looks for an occluder, in metres. This is what makes it "contact".</summary>
     public float MaxDistance { get; init; } = 0.8f;
@@ -20,20 +20,20 @@ public sealed record AoOptions
     /// triangles, and AO on four corner vertices would just tint the whole room; subdividing gives
     /// the shading somewhere to land. 0 disables subdivision.
     /// </summary>
-    public float MaxEdge { get; init; } = 0.4f;
+    public float MaxEdge { get; init; } = 0.6f;
 
     /// <summary>Hard cap on total triangles after subdivision, so a big model cannot explode.</summary>
     public long MaxTriangles { get; init; } = 3_000_000;
 
     /// <summary>
     /// Laplacian smoothing passes over the vertex graph. A finite ray count is noisy per vertex,
-    /// and interpolating noisy values across a half-metre triangle reads as blotches rather than
-    /// occlusion. 0 disables it.
+    /// and interpolating noisy values across a half-metre triangle reads as blotches and visible
+    /// facets rather than occlusion. 0 disables it.
     /// </summary>
-    public int SmoothingIterations { get; init; } = 2;
+    public int SmoothingIterations { get; init; } = 8;
 
     /// <summary>How far each pass moves a vertex toward its neighbours' average.</summary>
-    public float SmoothingStrength { get; init; } = 0.5f;
+    public float SmoothingStrength { get; init; } = 0.55f;
 }
 
 /// <summary>What a vertex-occlusion bake did, for the export report.</summary>

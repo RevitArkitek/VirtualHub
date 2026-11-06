@@ -170,11 +170,88 @@ var builtMin = MinColorByte(built.Build());
 Console.WriteLine($"       builder: {builtReport.TrianglesBefore} → {builtReport.TrianglesAfter} tris, darkest color {builtMin}");
 Check("the builder bakes real occlusion into COLOR_0", builtMin < 235, $"darkest={builtMin}");
 
+// ---------------------------------------------------------------- indirect bake
+Console.WriteLine("indirect");
+
+// A lone floor under an open sky is the reference: 1.0.
+var openSky = new SoupBuilder();
+openSky.Quad(new[] { (0f, 0f, 0f), (4f, 0f, 0f), (4f, 0f, 4f), (0f, 0f, 4f) }, normal: (0, 1, 0));
+var openBake = openSky.BakeIndirect(new IndirectOptions { Rays = 32, Bounces = 3 });
+Check("an open floor is fully lit", openBake.Ao.All(v => v > 0.9f), $"min={openBake.Ao.Min():0.00}");
+
+// The same floor with a ceiling over it: the room fills only by bounce. The ceiling has to be
+// wide enough to block the sun's *oblique* path too, or the "closed" room is open to the sky in
+// the sun's direction and lights up like an open field.
+var closedRoom = new SoupBuilder();
+closedRoom.Quad(new[] { (0f, 0f, 0f), (4f, 0f, 0f), (4f, 0f, 4f), (0f, 0f, 4f) }, normal: (0, 1, 0));
+closedRoom.Quad(new[] { (-6f, 2.5f, 8f), (12f, 2.5f, 8f), (12f, 2.5f, -8f), (-6f, 2.5f, -8f) }, normal: (0, -1, 0));
+var roomBakeIndirect = closedRoom.BakeIndirect(new IndirectOptions { Rays = 32, Bounces = 3 });
+Check("a closed room is darker than the open sky",
+    roomBakeIndirect.Ao.Max() < openBake.Ao.Min(), $"room={roomBakeIndirect.Ao.Max():0.00}");
+Check("a closed room is not black", roomBakeIndirect.Ao.Min() > 0.05f, $"min={roomBakeIndirect.Ao.Min():0.00}");
+
+var indirectAgain = closedRoom.BakeIndirect(new IndirectOptions { Rays = 32, Bounces = 3 });
+Check("the indirect bake is deterministic", indirectAgain.Ao.SequenceEqual(roomBakeIndirect.Ao));
+
+// Subdivision must not change the surface: a flat wall has to stay flat and keep its normal,
+// or every triangle would shade differently for a reason that has nothing to do with occlusion.
+var flat = new GltfBuilder();
+var flatMat = flat.GetMaterial("Flat", 0.8f, 0.8f, 0.8f);
+flat.AddTriangles(flatMat,
+    new List<float> { 0, 0, 0, 8, 0, 0, 8, 0, 8, 0, 0, 8 },
+    new List<float> { 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0 },
+    new List<int> { 0, 1, 2, 0, 2, 3 });
+flat.BakeVertexOcclusion(new AoOptions { Rays = 4, MaxEdge = 1.0f, SmoothingIterations = 0 });
+
+var (flatPos, flatNrm, flatTris) = ReadFirstMesh(flat.Build());
+Check("subdivision produces more triangles", flatTris > 2, $"{flatTris}");
+Check("subdivided vertices stay in the plane",
+    flatPos.All(p => Math.Abs(p.y) < 1e-5f), "a vertex left the plane");
+Check("subdivided normals are unchanged",
+    flatNrm.All(n => Math.Abs(n.x) < 1e-4f && Math.Abs(n.y - 1f) < 1e-4f && Math.Abs(n.z) < 1e-4f),
+    "a normal was rotated");
+
 Console.WriteLine();
 Console.WriteLine(fail == 0 ? $"all {pass} checks passed" : $"{pass} passed, {fail} FAILED");
 return fail == 0 ? 0 : 1;
 
 // ---------------------------------------------------------------------------
+/// <summary>Positions, normals and triangle count of the first mesh in a GLB.</summary>
+static (List<(float x, float y, float z)> Pos, List<(float x, float y, float z)> Nrm, int Tris) ReadFirstMesh(byte[] glb)
+{
+    var jsonLength = BitConverter.ToInt32(glb, 12);
+    var raw = glb.AsSpan(20, jsonLength).ToArray();
+    var doc = System.Text.Json.JsonDocument.Parse(raw.AsSpan(0, TrimLength(raw)).ToArray());
+    var binStart = 20 + jsonLength + 8;
+
+    var primitive = doc.RootElement.GetProperty("meshes")[0].GetProperty("primitives")[0];
+    var accessors = doc.RootElement.GetProperty("accessors");
+    var views = doc.RootElement.GetProperty("bufferViews");
+
+    List<(float x, float y, float z)> Read(int accessorIndex, int count, int components)
+    {
+        var accessor = accessors[accessorIndex];
+        var bufferView = views[accessor.GetProperty("bufferView").GetInt32()];
+        var offset = binStart + bufferView.GetProperty("byteOffset").GetInt32();
+        var list = new List<(float, float, float)>();
+        for (var i = 0; i < count; i++)
+        {
+            var at = offset + i * components * 4;
+            list.Add(components == 3
+                ? (BitConverter.ToSingle(glb, at), BitConverter.ToSingle(glb, at + 4), BitConverter.ToSingle(glb, at + 8))
+                : (0f, 0f, 0f));
+        }
+        return list;
+    }
+
+    var attributes = primitive.GetProperty("attributes");
+    var count = accessors[attributes.GetProperty("POSITION").GetInt32()].GetProperty("count").GetInt32();
+    var pos = Read(attributes.GetProperty("POSITION").GetInt32(), count, 3);
+    var nrm = Read(attributes.GetProperty("NORMAL").GetInt32(), count, 3);
+    var indices = accessors[primitive.GetProperty("indices").GetInt32()].GetProperty("count").GetInt32();
+    return (pos, nrm, indices / 3);
+}
+
 /// <summary>Smallest red channel in the first COLOR_0 accessor of a GLB, 0..255.</summary>
 static int MinColorByte(byte[] glb)
 {
@@ -245,6 +322,18 @@ internal sealed class SoupBuilder
     {
         var ao = new float[Positions.Count / 3];
         VertexOcclusion.Compute(Positions.ToArray(), Normals.ToArray(), Indices.ToArray(), options, ao);
+        return (ao, ao.Length);
+    }
+
+    public (float[] Ao, int VertexCount) BakeIndirect(IndirectOptions options)
+    {
+        var pos = Positions.ToArray();
+        var idx = Indices.ToArray();
+        var albedo = new float[idx.Length];          // one albedo triple per triangle, mid-grey
+        for (var i = 0; i < albedo.Length; i++) albedo[i] = 0.5f;
+
+        var ao = new float[pos.Length / 3];
+        IndirectLight.Compute(pos, Normals.ToArray(), idx, albedo, options, ao);
         return (ao, ao.Length);
     }
 }

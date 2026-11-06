@@ -41,7 +41,8 @@ renderer.xr.setReferenceSpaceType('local-floor');
 
 // ---------------------------------------------------------------- lighting
 app.scene.background = new THREE.Color(0x151b22);
-app.scene.add(new THREE.HemisphereLight(0xdce9ff, 0x3a3226, 0.55));
+const hemi = new THREE.HemisphereLight(0xdce9ff, 0x3a3226, 0.55);
+app.scene.add(hemi);
 const ambient = new THREE.AmbientLight(0xffffff, 0.18);
 app.scene.add(ambient);
 const sun = new THREE.DirectionalLight(0xfff2e2, 1.35);
@@ -343,6 +344,15 @@ async function load() {
   app.manifest = manifest;
   app.world = new CollisionWorld(manifest.segments, manifest.surfaces, manifest.terrain);
 
+  // Baked light supersedes the analytic ambient fill: the vertex colours already carry sky
+  // visibility and one bounce, so leaving the hemisphere at full strength would light the room
+  // twice and wash the bake out.
+  if (manifest.bakedLight) {
+    hemi.intensity *= 0.25;
+    ambient.intensity *= 0.25;
+    app.scene.environmentIntensity *= 0.6;
+  }
+
   const gltf = await new GLTFLoader().loadAsync('./scene/scene.glb');
   let tris = 0;
   gltf.scene.traverse((o) => {
@@ -354,6 +364,15 @@ async function load() {
       tris += (g.index ? g.index.count : g.attributes.position.count) / 3;
       const m = o.material;
       if (m) {
+        // Spike preview: the vertex colour carries the whole baked irradiance, so the surface must
+        // not be lit a second time by the renderer's lights. Unlit material, no tone mapping —
+        // the bake already carries a display curve.
+        if (app.manifest.bakedLight) {
+          o.material = new THREE.MeshBasicMaterial({
+            map: m.map, color: m.color, vertexColors: true, side: m.side, toneMapped: false,
+          });
+          return;
+        }
         m.envMapIntensity = 0.8;
         // Textures are the difference between a coloured massing model and a building: give them
         // the correct colour space, and let the GPU read them at the glancing angles a headset
