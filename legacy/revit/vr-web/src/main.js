@@ -355,7 +355,16 @@ async function load() {
       const m = o.material;
       if (m) {
         m.envMapIntensity = 0.8;
-        if (m.map) m.map.colorSpace = THREE.SRGBColorSpace;
+        // Textures are the difference between a coloured massing model and a building: give them
+        // the correct colour space, and let the GPU read them at the glancing angles a headset
+        // looks along at floors and walls.
+        const aniso = renderer.capabilities.getMaxAnisotropy();
+        if (m.map) {
+          m.map.colorSpace = THREE.SRGBColorSpace;
+          m.map.anisotropy = aniso;
+        }
+        if (m.normalMap) m.normalMap.anisotropy = aniso;
+        m.needsUpdate = true;
       }
     }
   });

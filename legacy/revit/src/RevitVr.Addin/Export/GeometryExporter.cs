@@ -26,6 +26,7 @@ public sealed class GeometryExporter
 
     private readonly Document _doc;
     private readonly GltfBuilder _builder;
+    private readonly TextureLibrary _textures;
     private readonly Dictionary<long, int> _materialCache = new();
     private readonly int _fallbackMaterial;
 
@@ -51,8 +52,12 @@ public sealed class GeometryExporter
     {
         _doc = doc;
         _builder = builder;
+        _textures = new TextureLibrary(doc, builder);
         _fallbackMaterial = builder.GetMaterial("Default", 0.72f, 0.72f, 0.70f, roughness: 0.9f);
     }
+
+    /// <summary>Appearance-asset textures, for the export report.</summary>
+    public TextureLibrary Textures => _textures;
 
     public void Export(View view)
     {
@@ -270,7 +275,35 @@ public sealed class GeometryExporter
         var roughness = Math.Clamp(1f - smoothness, 0.06f, 1f);
 
         var name = string.IsNullOrWhiteSpace(material.Name) ? "Material" : material.Name;
-        var index = _builder.GetMaterial(name, r, g, b, alpha, 0f, roughness);
+
+        // The render appearance decides what you actually see; the shading colour is only a
+        // fallback for materials whose asset has neither an image nor a diffuse colour.
+        var look = _textures.Look(material);
+        var metallic = look.IsMetal ? 0.85f : 0f;
+
+        int index;
+        if (look.BaseColor is not null || look.Normal is not null)
+        {
+            // A texture *is* the colour. Keeping Revit's shading colour here would multiply the
+            // photo by it and tint every surface dark, because the two systems share nothing.
+            index = _builder.GetMaterial(name, 1f, 1f, 1f, alpha, metallic, roughness,
+                                         baseTexture: look.BaseColor ?? -1,
+                                         normalTexture: look.Normal ?? -1,
+                                         normalScale: look.NormalScale,
+                                         tileMetresX: look.TileX,
+                                         tileMetresY: look.TileY,
+                                         offsetU: look.OffsetU,
+                                         offsetV: look.OffsetV);
+        }
+        else
+        {
+            if (look.Diffuse is { } diffuse)
+            {
+                r = diffuse.R; g = diffuse.G; b = diffuse.B;
+            }
+            index = _builder.GetMaterial(name, r, g, b, alpha, metallic, roughness);
+        }
+
         _materialCache[key] = index;
         return index;
     }

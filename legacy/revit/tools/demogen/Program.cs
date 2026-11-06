@@ -9,11 +9,28 @@ var outDir = args.Length > 0 ? args[0] : Path.Combine(AppContext.BaseDirectory, 
 Directory.CreateDirectory(outDir);
 
 var g = new GltfBuilder();
-var wallMat  = g.GetMaterial("Plaster", 0.86f, 0.85f, 0.82f, roughness: 0.92f);
-var floorMat = g.GetMaterial("Oak Floor", 0.45f, 0.31f, 0.19f, roughness: 0.65f);
-var doorMat  = g.GetMaterial("Door", 0.31f, 0.21f, 0.14f, roughness: 0.55f);
-var steelMat = g.GetMaterial("Steel", 0.42f, 0.44f, 0.46f, metallic: 0.15f, roughness: 0.35f);
-var rugMat   = g.GetMaterial("Rug", 0.22f, 0.28f, 0.36f, roughness: 1f);
+
+// Textures the way the Revit exporter supplies them: raw image bytes plus the real-world size of
+// one repeat. Procedural here so the whole path — UVs, embedded images, viewer — is testable
+// without a Revit session.
+var plasterTex = g.AddTexture("plaster", Textures.Plaster(), "image/png");
+var oakTex     = g.AddTexture("oak", Textures.OakPlanks(), "image/png");
+var oakNormal  = g.AddTexture("oak-normal", Textures.OakPlankNormal(), "image/png");
+var steelTex   = g.AddTexture("brushed-steel", Textures.BrushedSteel(), "image/png");
+var rugTex     = g.AddTexture("rug", Textures.Rug(), "image/png");
+
+var wallMat  = g.GetMaterial("Plaster", 1f, 1f, 1f, roughness: 0.92f,
+                             baseTexture: plasterTex, tileMetresX: 1.2f, tileMetresY: 1.2f);
+var floorMat = g.GetMaterial("Oak Floor", 1f, 1f, 1f, roughness: 0.55f,
+                             baseTexture: oakTex, normalTexture: oakNormal, normalScale: 0.55f,
+                             tileMetresX: 0.6f, tileMetresY: 2.4f);   // one texture = 5 boards by 4
+// The same board image as the floor: proves identical images are stored once, not twice.
+var doorMat  = g.GetMaterial("Door", 1f, 1f, 1f, roughness: 0.45f,
+                             baseTexture: oakTex, tileMetresX: 1.0f, tileMetresY: 1.0f);
+var steelMat = g.GetMaterial("Steel", 1f, 1f, 1f, metallic: 0.55f, roughness: 0.35f,
+                             baseTexture: steelTex, tileMetresX: 0.8f, tileMetresY: 0.8f);
+var rugMat   = g.GetMaterial("Rug", 1f, 1f, 1f, roughness: 1f,
+                             baseTexture: rugTex, tileMetresX: 2.0f, tileMetresY: 2.0f);
 
 const float W = 6f;        // partition line
 const float L = 10f;       // building length in x
@@ -79,7 +96,9 @@ for (var i = 0; i <= 2; i++)
 }
 
 // --- a sloped lawn outside the south door, so terrain walking can be tested --
-var grassMat = g.GetMaterial("Grass", 0.30f, 0.40f, 0.20f, roughness: 1f);
+var grassTex = g.AddTexture("grass", Textures.Grass(), "image/png");
+var grassMat = g.GetMaterial("Grass", 1f, 1f, 1f, roughness: 1f,
+                             baseTexture: grassTex, tileMetresX: 2.5f, tileMetresY: 2.5f);
 const float LawnX0 = -2f, LawnX1 = 12f, LawnZ0 = 4.1f, LawnZ1 = 12f, LawnRise = 2.0f;
 var lawnTris = new List<float[]>
 {
@@ -155,7 +174,8 @@ m.Segments.Add(new WallSegment
 File.WriteAllText(Path.Combine(outDir, "colliders.json"), m.ToJson());
 
 Console.WriteLine($"wrote {outDir}");
-Console.WriteLine($"  scene.glb      {glb.Length,10:N0} bytes  {g.TriangleCount,7:N0} tris  {g.MaterialCount} materials");
+Console.WriteLine($"{glb.Length,18:N0} bytes  {g.TriangleCount,7:N0} tris  {g.MaterialCount} materials  " +
+                  $"{g.TextureCount} textures ({g.TextureBytes / 1024.0:0} KB)");
 Console.WriteLine($"  colliders.json {m.Segments.Count,10} segments, {m.Surfaces.Count} surfaces");
 
 // ---------------------------------------------------------------------------

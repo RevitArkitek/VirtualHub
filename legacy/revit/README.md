@@ -25,6 +25,7 @@ Built and verified on this machine (Revit 2025, .NET 8, Quest path via adb):
 |---|---|
 | Revit add-in (ribbon, export, collider harvest) | compiles against real `RevitAPI.dll` / `RevitAPIUI.dll` |
 | GLB writer | passes the official Khronos `gltf-validator` — 0 errors, 0 warnings |
+| Textures (appearance-asset images, UVs, normal maps) | 46/46 headless assertions; textured GLB validates with 0 errors, 0 warnings and renders in a real browser |
 | Door cut-out geometry | 19/19 assertions on the shipped code (straight, curved and overlapping cases) |
 | Collider geometry (fitting, railing paths, containment) | 48/48 (rectangles, circles, degenerate input, measured heights, dropped phantom pieces, resampling, point-in-solid) |
 | Collision engine | 29/29 headless assertions — walls, doorways, stairs, terrain, oriented obstacles, railings |
@@ -43,11 +44,16 @@ Verified in-session against the demo scene and a real browser: instance placemen
 colliders, stair treads, terrain interpolation, and furniture obstacles.
 
 **Awaiting one Revit export to confirm against a real model** — the numbers to check are printed
-in the export dialog, and each has a documented meaning:
+in the export dialog, and each has a documented meaning. The texture harvest is the newest and
+least-proven piece: its parts are tested on their own (image preparation, path resolution, UVs,
+the GLB), but which materials in *your* model resolve an appearance image can only be seen by
+exporting it. The dialog names any texture it could not find, and those paths are the one thing
+likely to need extending in `TexturePathResolver.DefaultRoots()`.
 
 | Report line | What it tells you |
 |---|---|
 | `elements, instances, solids` | `instances` near zero means family instances aren't being reached |
+| `textures: N embedded (X MB), M of K materials textured` | `M` zero means no material's appearance asset yielded an image — every surface will be flat colour |
 | `wall runs → N wall segments, M obstacle boxes` | `M` zero means the obstacle categories aren't matching your families |
 | `railings: N found → M colliders (P height-measured, Q path-elevation, F footprint)` | `Q > 0` means those railings had no geometry to measure, so their barrier sits at the level's elevation and may be a storey off; `M` zero means railings exist but none produced a barrier |
 | `doors: N found, M cut` | `M < N` means some door hosts aren't resolving |
@@ -134,6 +140,9 @@ dotnet run --project tools/addincheck
 
 # railing colliders are railing-sized and agree with what renders (one storey off, or four metres tall)
 node tools/railcheck.mjs runtime/export
+
+# image preparation, texture-path resolution, UV projection and the textured GLB
+dotnet run --project tools/test-textures
 ```
 
 ## How this differs from Enscape
@@ -146,8 +155,11 @@ This reproduces the *interaction model*, not the pixels:
 
 - **Click → be inside the model.** Same.
 - **Walls are solid, doors are passable.** Same, and solved more cheaply (below).
-- **Rendering.** Base-colour + roughness per material, one directional light with a frozen shadow
-  map, no GI, no reflections, no textures yet. A clean schematic look rather than a photoreal one.
+- **Materials.** Base colour or texture, roughness, normal map per material — taken from the
+  render appearance, at the real-world size it was authored at.
+- **Rendering.** One directional light with a frozen shadow map and a procedural environment
+  probe: no global illumination, no reflections, no baked light. A clean, evenly lit look rather
+  than a photoreal one — textures read properly, but an unlit corner stays as bright as a lit one.
 
 ## Design decisions worth knowing
 
@@ -224,12 +236,44 @@ because it comes from the same curves the walls are built from — not from a de
 has thousands. Everything is merged into one primitive per material, so the draw call count equals
 the number of materials rather than the number of elements.
 
+**Textures come from the render appearance, not the shading colour.** A material's appearance
+asset, three levels down (`Material.AppearanceAssetId` → `AppearanceAssetElement` →
+`Asset`), carries an image only sometimes: a plain "Generic" material has a diffuse colour, and a
+procedural asset (wood, marble, metal) has parameters and no image at all. So the exporter asks
+each material what it has and takes what it finds — base-colour map, bump map as a normal map,
+diffuse colour, metal flag — and falls back to the shading colour for anything left over.
+
+Three things make the images usable rather than merely present:
+
+- **Revit geometry has no UVs.** None. Every tessellated face is positions and normals, so UVs are
+  generated during export by box projection in world space, decided per vertex by the normal's
+  dominant axis. Walls, floors and ceilings — what a walkthrough actually converges on — are each
+  a single plane, so the projection is exact for them, and a wall seen from its far side is not
+  mirrored. Curved surfaces get a seam where the dominant axis flips, which is the standard trade.
+- **Real-world scale.** Revit stores "Size X/Y" per texture — how many feet of building one repeat
+  covers — so a brick pattern authored at 2 m repeats every 2 m in the headset, instead of
+  stretching to whatever the element happens to be. Textures with no scale fall back to 1 m.
+- **Images are turned into something a GLB can carry.** glTF allows PNG and JPEG only, so a TiFF
+  or BMP texture is transcoded; anything over 2048 px on its longest side is scaled down (a Revit
+  library is full of 4K scans, and twenty of those will not fit in a standalone headset); opaque
+  PNGs become JPEG, since most are photographs stored in the wrong container. Any file that is
+  already a small PNG/JPEG is embedded byte for byte. Identical images are stored once, and every
+  material sharing one library bitmap points at a single copy.
+
+A texture that cannot be found is named in the export dialog rather than silently ignored — the
+difference between "textures do nothing" and "this file moved" is otherwise invisible.
+
 ## What is not built yet
 
 Roughly in order of how much they'd improve it:
 
-- **Textures.** Only base colour and roughness are exported. Pulling texture maps out of Revit
-  appearance assets is the single biggest visual upgrade.
+- **Lighting.** No global illumination and no reflections, which is now the largest gap to
+  Enscape: a textured interior is lit evenly rather than by light coming through windows.
+- **Material fidelity.** Only the diffuse/bump maps are read. Transparency, self-illumination,
+  refraction and Revit's procedural wood/marble/metal assets all fall back to flat colour.
+- **Texture alignment.** Box projection ignores the per-material rotation and mapping transform,
+  so a texture rotated in Revit arrives axis-aligned; UVs are not atlased, so each texture binds
+  separately.
 - **Large-model handling.** No LOD, no occlusion culling, no streaming, no compression. A
   1,000,000-triangle view will produce a ~100 MB GLB. Next step: per-element culling by room and
   `meshopt` compression.
@@ -250,8 +294,9 @@ src/RevitVr.Core/        GLB writer + scene schema (no Revit dependency, unit-te
 src/RevitVr.Addin/       Revit add-in: ribbon, IPhotoRenderContext export, collider harvest, adb
 src/RevitVr.Server/      Kestrel static server: viewer at /, scene at /scene/, /api/status
 vr-web/                  WebXR viewer: three.js, locomotion, collision
-tools/demogen/           synthetic two-room scene in the export format
+tools/demogen/           synthetic two-room scene in the export format, textures included
 tools/test-collision.mjs acceptance test for the collision rules
+tools/test-textures/     texture pipeline: encoder, path resolver, UVs, textured GLB
 tools/railcheck.mjs     railing colliders vs the geometry that actually renders
 tools/gltfcheck/         Khronos gltf-validator wrapper
 tools/addincheck/        verifies the deployed add-in resolves

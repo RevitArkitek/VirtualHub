@@ -127,10 +127,25 @@ public static class ExportJob
             $"Exported in {sw.Elapsed.TotalSeconds:0.0}s — {builder.TriangleCount:N0} tris, " +
             $"{builder.MaterialCount} materials, {stats.WallRuns} wall runs → {manifest.Segments.Count} colliders, " +
             $"{stats.Openings} door openings cut, {stats.RailingBoxes} railing colliders.\n" +
+            $"textures: {builder.TextureCount} embedded ({builder.TextureBytes / 1048576.0:0.0} MB), " +
+            $"{builder.TexturedMaterials} of {builder.MaterialCount} materials textured.\n" +
             $"{harvest.Elements:N0} elements, {harvest.Instances:N0} instances, {harvest.Solids:N0} solids." +
             (harvest.LightSourcesSkipped > 0
                 ? $"\n{harvest.LightSourcesSkipped} light-source meshes skipped."
                 : "");
+
+        // A material whose image could not be found silently renders as flat colour, which looks
+        // like the texture feature did nothing at all — so name the files.
+        if (harvest.Textures.MaterialsMissingImage > 0)
+        {
+            var shown = harvest.Textures.Warnings.Take(4).ToList();
+            message += $"\n\nWARNING: {harvest.Textures.MaterialsMissingImage} texture files could not be found " +
+                       "or decoded, so those materials export as flat colour:\n  " +
+                       string.Join("\n  ", shown) +
+                       (harvest.Textures.Warnings.Count > shown.Count
+                           ? $"\n  ...and {harvest.Textures.Warnings.Count - shown.Count} more (see log)"
+                           : "");
+        }
 
         // A zero here is the difference between "walkthrough" and "sealed box", so say it loudly.
         if (stats.DoorsFound > 0 && stats.Openings == 0)
