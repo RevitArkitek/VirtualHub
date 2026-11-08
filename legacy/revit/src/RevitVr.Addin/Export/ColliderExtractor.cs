@@ -155,7 +155,7 @@ public static class ColliderExtractor
             $"railings: {railings.Found} found → {railings.Boxes} colliders " +
             $"({railings.Measured} measured, {railings.FromPath3D} from a climbing path, " +
             $"{railings.FromBox} bbox-placed, {railings.Unplaced} unplaced, " +
-            $"{railings.FromFootprint} footprint); " +
+            $"{railings.FromFootprint} footprint, {railings.NoCollider} No Collider); " +
             $"{manifest.Surfaces.Count - treads} floor/roof surfaces, {treads} stair treads, " +
             $"{terrainTris} terrain triangles");
 
@@ -193,8 +193,8 @@ public static class ColliderExtractor
     private readonly record struct DoorStats(int Found, int Matched, int Unmatched);
 
     private readonly record struct RailingStats(
-        int Found, int Measured, int FromPath3D, int FromBox, int Unplaced, int FromFootprint,
-        int Boxes, IReadOnlyList<RailingReport> Reports);
+        int Found, int NoCollider, int Measured, int FromPath3D, int FromBox, int Unplaced,
+        int FromFootprint, int Boxes, IReadOnlyList<RailingReport> Reports);
 
 
     /// <summary>
@@ -253,6 +253,7 @@ public static class ColliderExtractor
         const double PathIs3DFt = 0.25 / Ft;
 
         var found = 0;
+        var noCollider = 0;
         var measured = 0;
         var fromPath3D = 0;
         var fromBox = 0;
@@ -270,6 +271,19 @@ public static class ColliderExtractor
         foreach (var element in railings)
         {
             found++;
+
+            // Railings get used for things that are not railings — a parking bay edge, a planting
+            // border, a line on a site plan. A type marked 'No Collider' stays visual only.
+            if (HasNoColliderFlag(doc, element))
+            {
+                noCollider++;
+                reports.Add(new RailingReport(
+                    element.Id.Value,
+                    doc.GetElement(element.GetTypeId())?.Name,
+                    0, 0, 0, 0, 0, "no-collider",
+                    Math.Round(RailingHeight(doc, element) * Ft, 3), 0f, 0f, "skipped", 0));
+                continue;
+            }
 
             var height = RailingHeight(doc, element);
             var candidates = new List<WallSegment>();
@@ -481,7 +495,7 @@ public static class ColliderExtractor
         }
 
         return new RailingStats(
-            found, measured, fromPath3D, fromBox, unplaced, fromFootprint, boxes, reports);
+            found, noCollider, measured, fromPath3D, fromBox, unplaced, fromFootprint, boxes, reports);
     }
 
     /// <summary>
@@ -669,6 +683,60 @@ public static class ColliderExtractor
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// True when the railing's type carries the 'No Collider' yes/no parameter set.
+    ///
+    /// A railing is a convenient line-work element, so it is used for parking bay edges, planting
+    /// borders and other drawing marks. Those are part of the model but not part of the building
+    /// you walk through, and a barrier where a parking line is would be baffling in the headset.
+    /// The parameter is read from the type first, then the instance, so either placement works.
+    /// </summary>
+    private static bool HasNoColliderFlag(Document doc, Element element)
+    {
+        const string Name = "No Collider";
+
+        var type = doc.GetElement(element.GetTypeId());
+        var parameter = FindParameter(type, Name) ?? FindParameter(element, Name);
+        if (parameter is null || !parameter.HasValue) return false;
+
+        return parameter.StorageType switch
+        {
+            StorageType.Integer => parameter.AsInteger() != 0,
+            StorageType.String => IsTruthy(parameter.AsString()),
+            _ => false,
+        };
+    }
+
+    /// <summary>
+    /// Looks a parameter up by name, ignoring case and surrounding space — a parameter the user
+    /// added by hand can arrive as 'No collider' or ' No Collider'.
+    /// </summary>
+    private static Parameter? FindParameter(Element? element, string name)
+    {
+        if (element is null) return null;
+
+        var exact = element.LookupParameter(name);
+        if (exact is not null) return exact;
+
+        foreach (Parameter parameter in element.Parameters)
+        {
+            var candidate = parameter.Definition?.Name;
+            if (candidate is null) continue;
+            if (string.Equals(candidate.Trim(), name, StringComparison.OrdinalIgnoreCase))
+                return parameter;
+        }
+
+        return null;
+    }
+
+    private static bool IsTruthy(string? text)
+    {
+        var value = text?.Trim();
+        return string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
+            || value == "1";
     }
 
     /// <summary>

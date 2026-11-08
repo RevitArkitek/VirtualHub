@@ -64,6 +64,7 @@ likely to need extending in `TexturePathResolver.DefaultRoots()`.
 | `light-source meshes skipped` | absent means the name heuristic missed your fixture families |
 | `N railings lost path pieces` | those railings have gaps in their barrier — `railings.json` names them by ElementId |
 | `… unplaced` in the railings line | those railings have no collider at all; `railings.json` gives the geometry strategy that failed for each |
+| `N No Collider` in the railings line | those railings were skipped on purpose by their type's `No Collider` parameter |
 
 ### Operational gotchas
 
@@ -260,7 +261,10 @@ add-in derives collision from the *model data instead of the render mesh*:
   Every railing collider carries its `sourceId`, and `railings.json` beside the scene records what
   each railing element produced (`measured` / `path-elevation` / `footprint` / `none`), how many
   path samples found no geometry, and its height — so a railing that misbehaves in the headset can
-  be traced to an ElementId instead of guessed at from coordinates;
+  be traced to an ElementId instead of guessed at from coordinates. A railing **type** carrying a
+  yes/no parameter called `No Collider` is left out of the collision world entirely: railings get
+  used as parking bay edges and planting borders, which are drawing marks rather than building
+  fabric, and a barrier where a parking line runs would be baffling to walk into;
 - a light fixture's photometric web — the mesh that shows how light spreads — is skipped, since
   it is a modelling aid rather than building fabric.
 
@@ -362,8 +366,8 @@ Roughly in order of how much they'd improve it:
 - **Live sync.** Enscape-style auto-refresh on model change is not implemented; re-click to
   re-export. The export is also synchronous on Revit's UI thread, so a big model blocks Revit
   while it runs (an `ExternalEvent` + progress bar is the fix).
-- **Overrides.** No way to mark a wall as passable, no swappable furniture, no measured
-  walkthrough, no annotation.
+- **Overrides.** A railing type can be excluded with its `No Collider` parameter, but there is no
+  way to mark a wall as passable, no swappable furniture, no measured walkthrough, no annotation.
 - **Hands / teleport.** Controllers are ray lines only; no arc teleport, no hand tracking.
 
 ## Spikes
