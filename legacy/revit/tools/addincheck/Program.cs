@@ -57,6 +57,29 @@ using (var mlc = new MetadataLoadContext(
             cmd.GetCustomAttributesData().Any(a => a.AttributeType.Name == "TransactionAttribute"));
     }
 
+    // The second ribbon button. Resolved by typeof() when the ribbon is built, so a missing or
+    // renamed class shows up as a button that does nothing when clicked — which is exactly the
+    // kind of fault this tool exists to catch before Revit does.
+    var reopen = meta.GetType("RevitVr.Addin.OpenViewerCommand");
+    Check("OpenViewerCommand present", reopen != null);
+    if (reopen != null)
+    {
+        Check("OpenViewerCommand implements IExternalCommand",
+            reopen.GetInterfaces().Any(i => i.Name == "IExternalCommand"));
+        Check("OpenViewerCommand is [Transaction]",
+            reopen.GetCustomAttributesData().Any(a => a.AttributeType.Name == "TransactionAttribute"));
+    }
+
+    var stage = meta.GetType("RevitVr.Addin.Launch.LaunchStage");
+    Check("LaunchStage enum present", stage is { IsEnum: true });
+    if (stage is { IsEnum: true })
+    {
+        var names = stage.GetFields(BindingFlags.Public | BindingFlags.Static).Select(f => f.Name).ToList();
+        Check("LaunchStage has Opened/NoAdb/ReverseFailed/OpenFailed",
+            new[] { "Opened", "NoAdb", "ReverseFailed", "OpenFailed" }.All(names.Contains),
+            string.Join(",", names));
+    }
+
     var harvest = meta.GetType("RevitVr.Addin.Export.GeometryExporter");
     Check("GeometryExporter present", harvest != null);
     Check("GeometryExporter has an Export(View) method",
