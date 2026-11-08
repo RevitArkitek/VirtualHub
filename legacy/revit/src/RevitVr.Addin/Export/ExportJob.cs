@@ -84,6 +84,13 @@ public sealed record ExportOutcome(
 
 public static class ExportJob
 {
+    /// <summary>
+    /// Above this, the export dialog suggests cropping. Measured on a Quest 3: a 3.4 M-triangle
+    /// building (155 MB GLB) runs acceptably, so this sits well past a normal project rather than
+    /// nagging about one.
+    /// </summary>
+    private const int HeavySceneTriangles = 6_000_000;
+
     public static ExportOutcome Run(Document doc, View view)
     {
         var sw = Stopwatch.StartNew();
@@ -205,10 +212,13 @@ public static class ExportJob
                        "could not be read and their extent spans more than one storey. railings.json " +
                        "lists them by ElementId — send it, with the log at " + App.LogPath;
 
-        if (builder.TriangleCount > 750_000)
-            message += "\n\nNote: this is a heavy scene for a standalone headset. Cropping the 3D view " +
-                       "to one floor gives a much smoother framerate, and makes the baked " +
-                       "occlusion sharper too.";
+        // 3.4 M triangles and a 155 MB GLB were measured running acceptably on a Quest 3, so the
+        // note is for scenes well past that rather than for a normal building.
+        if (builder.TriangleCount > HeavySceneTriangles)
+            message += $"\n\nNote: {builder.TriangleCount / 1_000_000.0:0.0} M triangles, " +
+                       $"{glb.Length / (1024 * 1024)} MB — a large scene for a standalone headset. " +
+                       "If the frame rate suffers, cropping the 3D view to one floor helps, and " +
+                       "makes the baked occlusion sharper too.";
 
         var outcome = new ExportOutcome(
             true, dir, message,

@@ -352,8 +352,10 @@ Roughly in order of how much they'd improve it:
   so a texture rotated in Revit arrives axis-aligned; UVs are not atlased, so each texture binds
   separately.
 - **Large-model handling.** No LOD, no occlusion culling, no streaming, no compression. A
-  1,000,000-triangle view will produce a ~100 MB GLB. Next step: per-element culling by room and
-  `meshopt` compression.
+  3.4 M-triangle building exports to a ~155 MB GLB and does run on a Quest 3, so the export
+  dialog only suggests cropping past 6 M triangles — but nothing culls, so a view of a whole
+  campus will not hold frame rate. Next step: per-element culling by room and `meshopt`
+  compression.
 - **Ramps.** Stair treads are walkable because each tread is a horizontal plane. A ramped
   surface is one sloped face, so it is skipped rather than approximated by a plane at its top —
   walking a ramp still needs fly mode.
