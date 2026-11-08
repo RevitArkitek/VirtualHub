@@ -162,6 +162,44 @@ public static class ColliderGeometry
     }
 
     /// <summary>
+    /// Height of the walkable surface a railing stands on, at a plan point (metres, glTF space).
+    ///
+    /// A railing belongs to the floor or tread it stands beside, not to the lowest point of its own
+    /// geometry. That distinction matters because the only geometry available for a railing is
+    /// often coarse: one simplified solid spanning the whole railing, whose minimum is the bottom
+    /// of the stair the railing climbs. Placing the barrier from that minimum put it a storey below
+    /// the railing — a barrier that dives away from the floor it belongs to.
+    ///
+    /// Surfaces above <paramref name="top"/> minus <paramref name="minDrop"/> are ignored, so an
+    /// overhanging slab is never mistaken for the floor a railing stands on.
+    /// </summary>
+    public static double? SurfaceBaseAt(
+        SceneManifest manifest, double x, double z, double top, double radius, double minDrop)
+    {
+        double? best = null;
+
+        foreach (var surface in manifest.Surfaces)
+        {
+            if (x < surface.MinX - radius || x > surface.MaxX + radius) continue;
+            if (z < surface.MinZ - radius || z > surface.MaxZ + radius) continue;
+            if (surface.Y > top - minDrop) continue;
+
+            if (surface.P is { Length: >= 6 })
+            {
+                var polygon = new List<PlanPoint>(surface.P.Length / 2);
+                for (var i = 0; i + 1 < surface.P.Length; i += 2)
+                    polygon.Add(new PlanPoint(surface.P[i], surface.P[i + 1]));
+
+                if (PlanGeometry.DistanceToPolygon(polygon, x, z) > radius) continue;
+            }
+
+            if (best is null || surface.Y > best) best = surface.Y;
+        }
+
+        return best;
+    }
+
+    /// <summary>
     /// A fitted footprint rectangle as one oriented box — the shape furniture, casework and
     /// columns are emitted as, and the fallback for a railing whose path cannot be read.
     /// </summary>

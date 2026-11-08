@@ -12,7 +12,7 @@ public sealed record ColliderStats(
     int DoorsMatched,
     int DoorsUnmatched,
     int RailingBoxes,
-    int RailingsUnmeasured,
+    int RailingsUnplaced,
     IReadOnlyList<RailingReport> Railings);
 
 /// <summary>
@@ -33,7 +33,9 @@ public sealed record RailingReport(
     string Outcome,
     double HeightFt,
     float MinY,
-    float MaxY);
+    float MaxY,
+    string Geometry,
+    int Solids);
 
 /// <summary>
 /// Derives the walkable world from Revit elements analytically instead of from the render mesh.
@@ -151,7 +153,8 @@ public static class ColliderExtractor
             $"{runs.Count} wall runs → {wallSegments} wall segments, {obstacles} obstacle boxes; doors: " +
             $"{doorStats.Found} found, {doorStats.Matched} cut, {doorStats.Unmatched} unmatched; " +
             $"railings: {railings.Found} found → {railings.Boxes} colliders " +
-            $"({railings.Measured} height-measured, {railings.Unmeasured} path-elevation, " +
+            $"({railings.Measured} measured, {railings.FromPath3D} from a climbing path, " +
+            $"{railings.FromBox} bbox-placed, {railings.Unplaced} unplaced, " +
             $"{railings.FromFootprint} footprint); " +
             $"{manifest.Surfaces.Count - treads} floor/roof surfaces, {treads} stair treads, " +
             $"{terrainTris} terrain triangles");
@@ -167,25 +170,31 @@ public static class ColliderExtractor
                 $"{dropped} railings lost path pieces where no railing geometry spanned the path; " +
                 "see railings.json for the element ids, and check those railings in the headset.");
 
-        if (railings.Unmeasured > 0)
+        if (railings.FromBox > 0)
             manifest.Warnings.Add(
-                $"{railings.Unmeasured} railings had no geometry to measure their height from; their " +
-                "barrier sits at the path elevation, which is the level rather than the railing. " +
-                "Railings on upper floors may not stop you.");
+                $"{railings.FromBox} railings could not be measured from their geometry and were " +
+                "placed from their bounding box. Fine for a flat railing; check them in the headset.");
+
+        if (railings.Unplaced > 0)
+            manifest.Warnings.Add(
+                $"{railings.Unplaced} railings could not be placed at all (no readable geometry, and " +
+                "their extent spans more than one storey, so a flat barrier would wall off a stair). " +
+                "They have no collider — railings.json names them by ElementId, with the geometry " +
+                "strategy that failed.");
         if (manifest.Surfaces.Count == 0)
             manifest.Warnings.Add("No floor slabs in view; using level elevations for walking height");
 
         return new ColliderStats(
             runs.Count, manifest.Segments.Count, openings,
             doorStats.Found, doorStats.Matched, doorStats.Unmatched,
-            railings.Boxes, railings.Unmeasured, railings.Reports);
+            railings.Boxes, railings.Unplaced, railings.Reports);
     }
 
     private readonly record struct DoorStats(int Found, int Matched, int Unmatched);
 
     private readonly record struct RailingStats(
-        int Found, int Measured, int Unmeasured, int FromFootprint, int Boxes,
-        IReadOnlyList<RailingReport> Reports);
+        int Found, int Measured, int FromPath3D, int FromBox, int Unplaced, int FromFootprint,
+        int Boxes, IReadOnlyList<RailingReport> Reports);
 
 
     /// <summary>
@@ -217,15 +226,37 @@ public static class ColliderExtractor
         // A path point that only finds a bracket or the edge of one rail is not a railing.
         const double MinBarrierFt = 0.3 / Ft;
 
+        // How far from a railing to look for the floor or tread it stands on, and how far below the
+        // railing's own top that floor must be. Coarse geometry spans whole railings, so its lowest
+        // point is the bottom of the stair — using it put barriers a storey below the railing.
+        const double SurfaceRadiusM = 1.0;
+        const double SurfaceMinDropM = 0.25;
+
+        // A solid taller than this is an aggregate standing in for whole sub-elements, so its
+        // height says nothing about the railing at one point along it.
+        const double AggregateSpanFt = 2.0 / Ft;
+
         // A measured span outside this band around the railing type's own height means the
         // measurement caught something else — the flight above, or a single rail — so the type
         // height wins.
         const double MaxSpanRatio = 1.35;
         const double MinSpanRatio = 0.4;
 
+        // Above this, a railing's bounding box spans more than one flight or storey, so it cannot
+        // be turned into a single flat barrier.
+        const double FlatRailingFt = 1.6 / Ft;
+
+        // A path whose own Z varies is a real 3-D path — the railing climbs — and then its Z is
+        // better evidence than the geometry. A spiral passes over the same plan position twice at
+        // different heights, so a plan-only measurement cannot tell the turns apart and puts the
+        // upper turn's barrier on the lower one.
+        const double PathIs3DFt = 0.25 / Ft;
+
         var found = 0;
         var measured = 0;
-        var unmeasured = 0;
+        var fromPath3D = 0;
+        var fromBox = 0;
+        var unplaced = 0;
         var fromFootprint = 0;
         var boxes = 0;
         var emitted = new HashSet<(int, int, int, int, int, int)>();
@@ -249,7 +280,7 @@ public static class ColliderExtractor
             var pathCurves = 0;
 
             var spans = new List<SolidSpan>();
-            var haveGeometry = TryCollectSpans(element, spans);
+            var haveGeometry = TryCollectSpans(element, view, spans, out var strategy);
 
             IList<Curve>? path = null;
             if (element is Railing railing)
@@ -275,6 +306,16 @@ public static class ColliderExtractor
                     // Measure along the path, not only at its vertices: a straight railing comes
                     // back as two points, and sampling just those makes one 4 m box out of a
                     // whole stair flight.
+                    var zSpread = verts.Max(pt => pt.Z) - verts.Min(pt => pt.Z);
+                    if (zSpread > PathIs3DFt)
+                    {
+                        // the path climbs: follow it, one railing tall above each point
+                        candidates.AddRange(ColliderGeometry.AlongPath(
+                            verts.Select(pt => (pt.X, pt.Y, pt.Z)).ToList(), height, ThicknessFt));
+                        if (outcome == "none") outcome = "path-3d";
+                        continue;
+                    }
+
                     var along = ColliderGeometry.Resample(
                         verts.Select(p => (p.X, p.Y, p.Z)).ToList(), SampleSpacingFt);
 
@@ -284,7 +325,7 @@ public static class ColliderExtractor
                         samples++;
 
                         var barrier = haveGeometry
-                            ? MeasureBarrier(spans, p.X, p.Y, MeasureToleranceFt)
+                            ? MeasureBarrier(spans, p.X, p.Y, MeasureToleranceFt, AggregateSpanFt)
                             : null;
 
                         if (barrier is null)
@@ -298,9 +339,23 @@ public static class ColliderExtractor
 
                         var (bottom, top) = barrier.Value;
 
-                        var span = top - bottom;
-                        if (span > height * MaxSpanRatio || span < height * MinSpanRatio)
+                        // The railing stands on the floor or tread beside it. That is a better
+                        // answer than the minimum of its own geometry, which for coarse geometry is
+                        // the bottom of the whole railing — the floor a storey down.
+                        var surface = ColliderGeometry.SurfaceBaseAt(
+                            manifest, p.X * Ft, -p.Y * Ft, top * Ft, SurfaceRadiusM, SurfaceMinDropM);
+
+                        if (surface is not null)
+                        {
+                            bottom = surface.Value / Ft;
                             top = bottom + Math.Max(height, MinBarrierFt);
+                        }
+                        else
+                        {
+                            var span = top - bottom;
+                            if (span > height * MaxSpanRatio || span < height * MinSpanRatio)
+                                top = bottom + Math.Max(height, MinBarrierFt);
+                        }
 
                         samplesHere.Add(new ColliderGeometry.PathSample(p.X, p.Y, bottom, top));
                     }
@@ -313,19 +368,39 @@ public static class ColliderExtractor
                     }
                 }
 
-                // ---- 2. no usable heights: raise the barrier from the path itself -
+                // ---- 2. no measurable geometry: place the barrier from the railing's extent
                 if (candidates.Count == 0)
                 {
-                    // Correct only when the path really is at the railing's elevation. Counted
-                    // separately and reported, because it is the failure that hides a railing.
-                    foreach (var curve in path)
-                    {
-                        if (curve is null) continue;
-                        var pts = Tessellate(curve).Select(p => (p.X, p.Y, p.Z)).ToList();
-                        candidates.AddRange(ColliderGeometry.AlongPath(pts, height, ThicknessFt));
-                    }
+                    // The element's bounding box still knows where the railing is even when its
+                    // geometry cannot be read — unlike the path, whose Z is the level's elevation.
+                    // Only trustworthy for a flat railing: a box spanning a whole stair flight
+                    // would flatten a barrier into the bottom of the flight, so those are left
+                    // unplaced and named in the report instead.
+                    var bbox = element.get_BoundingBox(view) ?? element.get_BoundingBox(null);
+                    var span = bbox is null ? 0 : bbox.Max.Z - bbox.Min.Z;
 
-                    if (candidates.Count > 0) outcome = "path-elevation";
+                    if (bbox is not null && span > 0.15 / Ft && span <= FlatRailingFt)
+                    {
+                        var baseZ = bbox.Min.Z;
+                        var topZ = Math.Min(bbox.Max.Z, baseZ + Math.Max(height, MinBarrierFt));
+
+                        foreach (var curve in path)
+                        {
+                            if (curve is null) continue;
+                            var verts = Tessellate(curve)
+                                .Select(pt => new ColliderGeometry.PathSample(pt.X, pt.Y, baseZ, topZ))
+                                .ToList();
+                            candidates.AddRange(ColliderGeometry.AlongPath(verts, ThicknessFt));
+                        }
+
+                        if (candidates.Count > 0) outcome = "bbox";
+                    }
+                    else if (bbox is not null)
+                    {
+                        // a railing that climbs: its barrier has to follow the geometry, and there
+                        // is none. Better to leave it out and say so than to wall off a stair.
+                        outcome = "unplaced";
+                    }
                 }
             }
 
@@ -382,7 +457,9 @@ public static class ColliderExtractor
             switch (outcome)
             {
                 case "measured": measured++; break;
-                case "path-elevation": unmeasured++; break;
+                case "path-3d": fromPath3D++; break;
+                case "bbox": fromBox++; break;
+                case "unplaced": unplaced++; break;
                 case "footprint": fromFootprint++; break;
             }
 
@@ -397,11 +474,14 @@ public static class ColliderExtractor
                 added,
                 outcome,
                 Math.Round(height * Ft, 3),
-                candidates.Count > 0 ? candidates.Min(s => s.Y0) : 0f,
-                candidates.Count > 0 ? candidates.Max(s => s.Y1) : 0f));
+                candidates.Count > 0 ? candidates.Min(x => x.Y0) : 0f,
+                candidates.Count > 0 ? candidates.Max(x => x.Y1) : 0f,
+                strategy,
+                spans.Count));
         }
 
-        return new RailingStats(found, measured, unmeasured, fromFootprint, boxes, reports);
+        return new RailingStats(
+            found, measured, fromPath3D, fromBox, unplaced, fromFootprint, boxes, reports);
     }
 
     /// <summary>
@@ -447,7 +527,7 @@ public static class ColliderExtractor
     /// therefore leaves gaps between posts, which is a hole you can walk through.
     /// </summary>
     private static (double Bottom, double Top)? MeasureBarrier(
-        List<SolidSpan> solids, double x, double y, double tolerance)
+        List<SolidSpan> solids, double x, double y, double tolerance, double maxSolidSpanFt)
     {
         var found = false;
         var bottom = double.MaxValue;
@@ -456,6 +536,10 @@ public static class ColliderExtractor
         foreach (var solid in solids)
         {
             if (PlanGeometry.DistanceToPolygon(solid.Plan, x, y) > tolerance) continue;
+
+            // a solid spanning the whole railing cannot place a barrier at one point along it
+            if (solid.MaxZ - solid.MinZ > maxSolidSpanFt) continue;
+
             found = true;
             if (solid.MinZ < bottom) bottom = solid.MinZ;
             if (solid.MaxZ > top) top = solid.MaxZ;
@@ -464,15 +548,45 @@ public static class ColliderExtractor
         return found ? (bottom, top) : null;
     }
 
-    private static bool TryCollectSpans(Element element, List<SolidSpan> spans)
+    /// <summary>
+    /// Reads a railing's geometry, trying the option sets that actually return it.
+    ///
+    /// A railing is a view-dependent element built from sub-elements, and an Options without a
+    /// view can come back empty for one — which is how 98 railings in a real model ended up with
+    /// no barrier at all while still rendering. The strategy that worked is reported per railing,
+    /// so a model where none of them work says so instead of failing silently.
+    /// </summary>
+    private static bool TryCollectSpans(Element element, View view, List<SolidSpan> spans, out string strategy)
     {
-        GeometryElement? geometry;
-        try { geometry = element.get_Geometry(FineOptions()); }
-        catch { return false; }
-        if (geometry is null) return false;
+        var attempts = new (string Name, Func<Options> Make)[]
+        {
+            ("view-fine", () => FineOptions(view)),
+            ("fine", () => FineOptions()),
+            ("view-medium-visible", () => new Options
+            {
+                ComputeReferences = false, IncludeNonVisibleObjects = true,
+                DetailLevel = ViewDetailLevel.Medium, View = view,
+            }),
+            ("coarse-visible", () => new Options
+            {
+                ComputeReferences = false, IncludeNonVisibleObjects = true,
+                DetailLevel = ViewDetailLevel.Coarse,
+            }),
+        };
 
-        CollectSpans(geometry, Transform.Identity, spans, 0);
-        return spans.Count > 0;
+        foreach (var (name, make) in attempts)
+        {
+            GeometryElement? geometry;
+            try { geometry = element.get_Geometry(make()); }
+            catch { continue; }
+            if (geometry is null) continue;
+
+            CollectSpans(geometry, Transform.Identity, spans, 0);
+            if (spans.Count > 0) { strategy = name; return true; }
+        }
+
+        strategy = "none";
+        return false;
     }
 
     private static void CollectSpans(
@@ -486,11 +600,23 @@ public static class ColliderExtractor
             {
                 case GeometryInstance instance:
                 {
-                    GeometryElement? symbol;
+                    GeometryElement? symbol = null;
                     try { symbol = instance.GetSymbolGeometry(); }
-                    catch { continue; }
-                    if (symbol is null) continue;
-                    CollectSpans(symbol, transform.Multiply(instance.Transform), spans, depth + 1);
+                    catch { symbol = null; }
+
+                    if (symbol is not null)
+                    {
+                        CollectSpans(symbol, transform.Multiply(instance.Transform), spans, depth + 1);
+                        break;
+                    }
+
+                    // some nested instances only expose project-space geometry
+                    GeometryElement? placed = null;
+                    try { placed = instance.GetInstanceGeometry(); }
+                    catch { placed = null; }
+                    if (placed is not null)
+                        CollectSpans(placed, transform, spans, depth + 1);
+
                     break;
                 }
 
@@ -997,11 +1123,12 @@ public static class ColliderExtractor
     /// source view's settings, for the same reason the render export does: a coarse view would
     /// otherwise hide the geometry the collider is fitted to.
     /// </summary>
-    private static Options FineOptions() => new()
+    private static Options FineOptions(View? view = null) => new()
     {
         ComputeReferences = false,
         IncludeNonVisibleObjects = false,
         DetailLevel = ViewDetailLevel.Fine,
+        View = view,
     };
 
     private static void CollectObstaclePoints(GeometryElement geometry, Transform transform,

@@ -1,9 +1,10 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { CollisionWorld } from './collision.js';
+import { buildColliderView } from './colliderview.js';
 
 const UP = new THREE.Vector3(0, 1, 0);
-const RADIUS = 0.30;       // player capsule radius, metres
+const RADIUS = 0.20;       // player capsule radius, metres. 0.30 was too fat once railing colliders landed on the stairs: on a 0.9 m flight it left a 0.2 m corridor, so you could not climb. 0.20 leaves ~0.65 m on the same stair.
 const HEAD = 1.72;         // capsule height above the floor
 const WALK = 1.65;         // m/s
 const RUN = 3.4;
@@ -19,6 +20,9 @@ const app = {
   world: null,
   manifest: null,
   fly: false,
+  colliderView: null,
+  collidersVisible: false,
+  needsRecentre: false,
   floorY: 0,
   yawLatch: 0,
   stats: { frames: 0, blocked: 0, tris: 0 },
@@ -112,6 +116,7 @@ addEventListener('keydown', (e) => {
   keys.add(e.code);
   if (e.code === 'KeyF') toggleFly();
   if (e.code === 'KeyR') respawn();
+  if (e.code === 'KeyC') toggleColliders();
 });
 addEventListener('keyup', (e) => keys.delete(e.code));
 
@@ -139,13 +144,51 @@ for (let i = 0; i < 2; i++) {
   );
   c.add(line);
   c.addEventListener('connected', (e) => { c.userData.handedness = e.data.handedness; });
-  c.addEventListener('selectstart', () => { if (c.userData.handedness === 'right') toggleFly(); });
+  c.addEventListener('selectstart', () => {
+    if (c.userData.handedness === 'right') toggleFly();
+  });
+
+  // left grip, not the trigger: the left trigger is held for boost, so a press-to-toggle there
+  // fought with locomotion. The grip is the one input nothing else uses during a walkthrough.
+  c.addEventListener('squeezestart', () => {
+    if (c.userData.handedness === 'left') toggleColliders();
+  });
   app.rig.add(c);
   controllers.push(c);
 }
 
 const tmpV = new THREE.Vector3();
 const tmpV2 = new THREE.Vector3();
+const tmpHead = new THREE.Vector3();
+
+/**
+ * Where the head is, in world space. Almost everywhere the player's position is needed, the
+ * head is what to use: in a headset you stand somewhere inside your play area, not at its
+ * origin, so the rig alone is not where the player is.
+ */
+function headWorld() {
+  return app.camera.getWorldPosition(tmpHead);
+}
+
+/** Head displacement from the rig origin, in world space. Zero on the desktop. */
+function headOffset() {
+  const head = headWorld();
+  return { x: head.x - app.rig.position.x, z: head.z - app.rig.position.z };
+}
+
+/**
+ * Moves the rig so the head sits over the rig origin.
+ *
+ * Without this the capsule and the body are two different places: walk into a railing and you
+ * stop short of it by however far you happen to stand from the play-area origin — a constant
+ * clearance that follows you around and reads as colliders being in the wrong place.
+ */
+function recentreOnHead() {
+  if (!renderer.xr.isPresenting) return;
+  const offset = headOffset();
+  app.rig.position.x += offset.x;
+  app.rig.position.z += offset.z;
+}
 
 // ---------------------------------------------------------------- session
 const btn = document.getElementById('enter');
@@ -155,6 +198,7 @@ btn.addEventListener('click', async () => {
       optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking', 'layers'],
     });
     await renderer.xr.setSession(session);
+    app.needsRecentre = true;      // the first XR frame supplies the head pose
     session.addEventListener('end', () => { app.camera.position.set(0, 1.6, 0); document.body.classList.remove('presenting'); });
     document.body.classList.add('presenting');
   } catch (err) {
@@ -176,6 +220,20 @@ function toggleFly() {
   }
   flash(app.fly ? 'FLY' : 'WALK');
 }
+/**
+ * Shows or hides the collision world as translucent boxes.
+ *
+ * Turning it on makes the invisible visible: a railing that stops you two metres early, or a
+ * barrier with a hole in it, is obvious once the boxes are drawn over the model.
+ */
+function toggleColliders(force = null) {
+  if (!app.colliderView) return;
+  const next = force === null ? !app.collidersVisible : !!force;
+  app.collidersVisible = next;
+  app.colliderView.visible = next;
+  flash(next ? 'COLLIDERS ON (C)' : 'COLLIDERS OFF');
+}
+
 function respawn(opts = {}) {
   const m = app.manifest;
   app.rig.position.set(m.spawn[0], Math.max(0, m.spawn[1] - m.eyeHeight), m.spawn[2]);
@@ -184,6 +242,7 @@ function respawn(opts = {}) {
   app.rig.rotation.y = yaw;
   pitch = 0;
   app.camera.rotation.set(0, 0, 0);
+  if (renderer.xr.isPresenting) recentreOnHead();
   if (!opts.silent) flash('RESPAWN');
 }
 function flash(t) {
@@ -220,16 +279,26 @@ function step(dt, wish, turn, boost = false) {
   if (!app.fly) {
     const p = app.rig.position;
     const before = { x: p.x, z: p.z };
+
+    // Resolve the capsule at the head, then move the rig by whatever correction was needed.
+    // Resolving the rig origin instead leaves you stopped a body's width away from every wall.
+    const offset = headOffset();
+    const head = { x: p.x + offset.x + dx, z: p.z + offset.z + dz };
+
     p.x += dx;
     p.z += dz;
-    const blocked = app.world.resolve(p, RADIUS, p.y, p.y + HEAD);
+
+    const blocked = app.world.resolve(head, RADIUS, p.y, p.y + HEAD);
     if (blocked) app.stats.blocked++;
+
+    p.x += head.x - (p.x + offset.x);
+    p.z += head.z - (p.z + offset.z);
 
     // keep the capsule out of walls even if the player spawned inside one
     if (before.x === p.x && before.z === p.z && (dx || dz)) app.stats.blocked++;
 
     // ground snapping: highest walkable slab under us within one stair riser
-    const g = app.world.groundAt(p.x, p.z, app.floorY, 0.45, 3.0);
+    const g = app.world.groundAt(head.x, head.z, app.floorY, 0.45, 3.0);
     if (g !== null && Math.abs(g - app.floorY) > 1e-4) {
       app.floorY += (g - app.floorY) * Math.min(1, dt * 12);
       p.y = app.floorY;
@@ -305,6 +374,13 @@ function readThumbsticks(sources = renderer.xr.getSession()?.inputSources ?? [])
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.05);
+
+  // the head pose only exists inside an XR frame, so the first frame after starting is the
+  // earliest the rig can be lined up under the player
+  if (app.needsRecentre && renderer.xr.isPresenting) {
+    recentreOnHead();
+    app.needsRecentre = false;
+  }
   if (renderer.xr.isPresenting) {
     const { wish, turn, rightY, boost } = readThumbsticks();
     // Fly: left stick travels (forward/back and strafe) exactly as it does on foot, and the
@@ -332,7 +408,8 @@ function updateHud() {
   document.getElementById('hud').textContent =
     `${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)} m` +
     `   ${app.stats.tris.toLocaleString()} tris` +
-    (app.fly ? '   FLY' : '');
+    (app.fly ? '   FLY' : '') +
+    (app.collidersVisible ? '   COLLIDERS' : '');
 }
 
 // ---------------------------------------------------------------- load
@@ -343,6 +420,13 @@ async function load() {
   });
   app.manifest = manifest;
   app.world = new CollisionWorld(manifest.segments, manifest.surfaces, manifest.terrain);
+
+  // the collision world, drawable on demand; ?colliders turns it on at load, which is what makes
+  // a screenshot of a suspect railing reproducible
+  app.colliderView = buildColliderView(manifest.segments);
+  app.colliderView.visible = false;
+  app.scene.add(app.colliderView);
+  if (new URLSearchParams(location.search).has('colliders')) toggleColliders(true);
 
   // Baked light supersedes the analytic ambient fill: the vertex colours already carry sky
   // visibility and one bounce, so leaving the hemisphere at full strength would light the room
@@ -433,6 +517,9 @@ function debugApi() {
     },
     groundAt: (x, z) => app.world.groundAt(x, z, app.floorY),
     get blocked() { return app.stats.blocked; },
+    toggleColliders,
+    get collidersVisible() { return app.collidersVisible; },
+    get colliderCount() { return app.colliderView ? app.colliderView.userData.count : 0; },
 
     /** Heading the camera is actually looking along, degrees (0 = -Z, positive = left). */
     heading() {

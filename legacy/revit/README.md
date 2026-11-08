@@ -63,6 +63,7 @@ likely to need extending in `TexturePathResolver.DefaultRoots()`.
 | `surfaces, treads, terrain triangles` | zero treads/terrain means the geometry didn't produce walkable faces |
 | `light-source meshes skipped` | absent means the name heuristic missed your fixture families |
 | `N railings lost path pieces` | those railings have gaps in their barrier — `railings.json` names them by ElementId |
+| `… unplaced` in the railings line | those railings have no collider at all; `railings.json` gives the geometry strategy that failed for each |
 
 ### Operational gotchas
 
@@ -108,9 +109,28 @@ self-signed certificate warning once on the headset.
 | Left stick | walk |
 | Right stick left/right | snap turn 30° per push, in the direction you push — let the stick spring back before the next step |
 | Trigger / A | toggle fly mode |
+| Left grip | show the collision world |
 | Left trigger (hold) | fast navigation: 3× movement speed while held — walking, flying and climbing; snap turn stays 30° |
 | While flying | left stick ↑↓ forward/back, ←→ strafe — same as walking. Right stick ↑↓ climbs (push forward) / descends (pull back), ←→ still snap turns |
-| Desktop | WASD, drag to look, `F` fly, `Q`/`E` down/up, `R` respawn |
+| Desktop | WASD, drag to look, `F` fly, `Q`/`E` down/up, `R` respawn, `C` colliders |
+
+## Seeing the colliders
+
+Walkthrough problems are invisible without this: the collision world is derived, not rendered, so
+you cannot tell whether you were stopped by the railing you can see, by a barrier a metre away from
+it, or by nothing at all. Press `C` (left controller trigger in VR, or open the page with
+`?colliders`) to draw every collider as a translucent box:
+
+| Colour | What it is |
+|---|---|
+| Red | railing |
+| Blue | wall |
+| Amber | furniture, casework, columns |
+| Grey | anything else |
+
+The boxes are drawn at the thickness and height range the collision engine actually uses, so a
+barrier that is too tall, too far out, or missing where you expected one is visible before you walk
+into it.
 
 ## Test it without Revit
 
@@ -234,6 +254,9 @@ add-in derives collision from the *model data instead of the render mesh*:
   corners sit only at its ends, so a corner test leaves holes between posts — and a hole is a
   railing you walk through. A railing whose geometry cannot be read at all is emitted at the path
   elevation and counted in the export report, because that is the case that hides a railing.
+  A railing whose geometry cannot be read is placed from its bounding box when its extent is a
+  single flat railing, and left unplaced when that extent spans a stair flight or two storeys — a
+  flat barrier there would wall off the stair. Both cases are counted in the export report.
   Every railing collider carries its `sourceId`, and `railings.json` beside the scene records what
   each railing element produced (`measured` / `path-elevation` / `footprint` / `none`), how many
   path samples found no geometry, and its height — so a railing that misbehaves in the headset can

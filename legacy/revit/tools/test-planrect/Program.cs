@@ -250,5 +250,42 @@ Check("containment follows a rotated footprint",
     PlanGeometry.DistanceToPolygon(post, 2, 1) == 0 && PlanGeometry.DistanceToPolygon(post, 2.2, 1) > 0.1,
     PlanGeometry.DistanceToPolygon(post, 2.2, 1).ToString("0.000"));
 
+// ---------------------------------------------------------------- railing base surfaces
+// The fix for barriers diving to the floor below: a railing stands on the floor or tread beside
+// it, not on the lowest point of its own (often coarse) geometry.
+var surfacesManifest = new SceneManifest();
+surfacesManifest.Surfaces.Add(new WalkSurface { MinX = -5f, MaxX = 5f, MinZ = -5f, MaxZ = 5f, Y = 3f });     // floor at 3 m
+surfacesManifest.Surfaces.Add(new WalkSurface { MinX = -5f, MaxX = 5f, MinZ = -5f, MaxZ = 5f, Y = 0f });     // floor at 0 m
+surfacesManifest.Surfaces.Add(new WalkSurface { MinX = -5f, MaxX = 5f, MinZ = -5f, MaxZ = 5f, Y = 6.2f });   // slab above
+
+Check("base is the floor the railing stands on, not the one below",
+    ColliderGeometry.SurfaceBaseAt(surfacesManifest, 0, 0, top: 4.0, radius: 1.0, minDrop: 0.25) is 3.0,
+    ColliderGeometry.SurfaceBaseAt(surfacesManifest, 0, 0, 4.0, 1.0, 0.25)?.ToString() ?? "null");
+Check("a slab above the railing is not its floor",
+    ColliderGeometry.SurfaceBaseAt(surfacesManifest, 0, 0, top: 4.0, radius: 1.0, minDrop: 0.25) < 4.0);
+Check("nothing within reach returns null",
+    ColliderGeometry.SurfaceBaseAt(surfacesManifest, 50, 50, 4.0, 1.0, 0.25) is null);
+
+// a stair of treads: the base must follow them, which is what makes a rail climb
+var stairManifest = new SceneManifest();
+for (var i = 0; i < 10; i++)
+{
+    var zFar = -0.3f * (i + 1);
+    var zNear = -0.3f * i;
+    stairManifest.Surfaces.Add(new WalkSurface
+    {
+        MinX = -0.6f, MaxX = 0.6f, MinZ = zFar, MaxZ = zNear, Y = 0.18f * (i + 1),
+        P = new[] { -0.6f, zFar, 0.6f, zFar, 0.6f, zNear, -0.6f, zNear },
+    });
+}
+var bases = Enumerable.Range(1, 9)
+    .Select(i => ColliderGeometry.SurfaceBaseAt(stairManifest, 0.5, -0.3 * i, top: 3.0, radius: 1.0, minDrop: 0.25))
+    .ToList();
+Check("base follows the treads up a flight",
+    bases.All(b => b is not null) && bases.Zip(bases.Skip(1)).All(p => p.Second >= p.First),
+    string.Join(" ", bases.Select(b => b?.ToString("0.00") ?? "null")));
+Check("treads are matched just outside their outline",
+    ColliderGeometry.SurfaceBaseAt(stairManifest, 0.75, -0.75, 3.0, radius: 1.0, minDrop: 0.25) is not null);
+
 Console.WriteLine($"{pass} passed, {fail} failed");
 return fail == 0 ? 0 : 1;

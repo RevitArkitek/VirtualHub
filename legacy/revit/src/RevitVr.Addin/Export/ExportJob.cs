@@ -200,10 +200,10 @@ public static class ExportJob
             message += $"\n\nWARNING: {stats.DoorsFound} doors found, none matched a wall. " +
                        "Doorways will be solid — send the log at " + App.LogPath;
 
-        if (stats.RailingsUnmeasured > 0)
-            message += $"\n\nWARNING: {stats.RailingsUnmeasured} railings could not be measured from their " +
-                       "geometry, so their barrier sits at the level's elevation. Railings on upper " +
-                       "floors will not stop you — send the log at " + App.LogPath;
+        if (stats.RailingsUnplaced > 0)
+            message += $"\n\nWARNING: {stats.RailingsUnplaced} railings have no collider: their geometry " +
+                       "could not be read and their extent spans more than one storey. railings.json " +
+                       "lists them by ElementId — send it, with the log at " + App.LogPath;
 
         if (builder.TriangleCount > 750_000)
             message += "\n\nNote: this is a heavy scene for a standalone headset. Cropping the 3D view " +
