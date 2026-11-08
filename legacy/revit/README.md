@@ -103,20 +103,28 @@ want to walk, or use a section box.
 No adb? The add-in falls back to HTTPS over Wi-Fi and shows you the address. Accept the
 self-signed certificate warning once on the headset.
 
-### The two ribbon buttons
+### The three ribbon buttons
 
 | Button | What it does |
 |---|---|
 | **Enter VR** | Exports the active 3D view, then opens it on the headset. This is the one that changes the scene. |
-| **Open Viewer** | Re-opens the *last* export without exporting again. Nothing is re-read from the model. |
+| **Open Viewer** | Re-opens the *last* export on the headset without exporting again. Nothing is re-read from the model. |
+| **Preview Desktop** | Opens the *last* export in this PC's browser — same viewer, same renderer, no headset. |
 
 The export runs synchronously on Revit's UI thread, so on a large model Enter VR blocks Revit for
-as long as it takes. Open Viewer is the way back in without paying that again — the headset went
-to sleep, the browser tab closed, adb dropped. It serves whatever is in
-`%LOCALAPPDATA%\RevitVR\export` whichever document is open, so its dialog names the scene and when
-it was exported, and says so when that isn't the project you have open. With no export to serve it
-refuses and tells you to press Enter VR; if the launch fails it says which step failed rather than
-reporting success anyway.
+as long as it takes. Open Viewer and Preview Desktop are the way back in without paying that
+again — the headset went to sleep, the browser tab closed, adb dropped, or you want to check the
+model before putting anything on your head. Both serve whatever is in
+`%LOCALAPPDATA%\RevitVR\export` whichever document is open, so their dialogs name the scene and
+when it was exported, and say so when that isn't the project you have open. With no export to
+serve they refuse and tell you to press Enter VR; if a launch fails they say which step failed
+rather than reporting success anyway.
+
+Preview Desktop is plain `http://localhost:<port>` on loopback, so it needs no certificate and no
+adb. The page keeps working after you leave it alone: press Enter VR for a new export, then reload
+the tab. Desktop controls are listed on the page (and in [Controls](#controls)); `C` draws the
+colliders, which is the quickest way to see why a wall stopped you before you go hunting for it in
+the headset.
 
 ## Controls
 

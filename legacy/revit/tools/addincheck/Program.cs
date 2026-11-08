@@ -80,6 +80,20 @@ using (var mlc = new MetadataLoadContext(
             string.Join(",", names));
     }
 
+    // The third button: the same scene in this PC's browser.
+    var preview = meta.GetType("RevitVr.Addin.PreviewCommand");
+    Check("PreviewCommand present", preview != null);
+    if (preview != null)
+    {
+        Check("PreviewCommand implements IExternalCommand",
+            preview.GetInterfaces().Any(i => i.Name == "IExternalCommand"));
+        Check("PreviewCommand is [Transaction]",
+            preview.GetCustomAttributesData().Any(a => a.AttributeType.Name == "TransactionAttribute"));
+    }
+
+    Check("Desktop URL opener present", meta.GetType("RevitVr.Addin.Launch.Desktop") != null);
+    Check("SceneFiles present", meta.GetType("RevitVr.Addin.Export.SceneFiles") != null);
+
     var harvest = meta.GetType("RevitVr.Addin.Export.GeometryExporter");
     Check("GeometryExporter present", harvest != null);
     Check("GeometryExporter has an Export(View) method",
@@ -105,6 +119,37 @@ if (pathsType != null)
     Check("server exe resolved", server != null, server ?? "null");
     Check("server exe on disk", server != null && File.Exists(server));
     Check("export dir creatable", export != null && Directory.Exists(export), export ?? "null");
+}
+
+// SceneFiles.Describe is Revit-free, so the text both viewer commands show can be checked for
+// real rather than by reading it: it is the only thing standing between "this is the right
+// scene" and "this is last week's project".
+var sceneFiles = asm.GetType("RevitVr.Addin.Export.SceneFiles");
+Check("SceneFiles type loads", sceneFiles != null);
+if (sceneFiles != null)
+{
+    var ready = (bool)sceneFiles.GetProperty("Ready")!.GetValue(null)!;
+    Console.WriteLine($"        (export folder {(ready ? "has" : "has no")} scene)");
+
+    var describe = sceneFiles.GetMethod("Describe", new[] { typeof(string), typeof(string) })!;
+    var temp = Path.Combine(Path.GetTempPath(), "revitvr-describe-check.json");
+    File.WriteAllText(temp,
+        "{\"name\":\"Tower A\",\"generatedUtc\":\"2026-01-02T03:04:05.0000000Z\"}");
+
+    var mismatched = (string)describe.Invoke(null, new object?[] { temp, "Tower B" })!;
+    Check("Describe names the scene", mismatched.Contains("Scene: Tower A"), mismatched.Trim());
+    Check("Describe flags a scene from another document",
+        mismatched.Contains("not the open document 'Tower B'"));
+    Check("Describe dates a stale export", mismatched.Contains("not today"));
+
+    var matched = (string)describe.Invoke(null, new object?[] { temp, "Tower A" })!;
+    Check("Describe stays quiet for the open document",
+        !matched.Contains("not the open document"));
+
+    var unreadable = (string)describe.Invoke(null, new object?[] { temp + ".missing", null })!;
+    Check("Describe returns empty for an unreadable manifest", unreadable.Length == 0);
+
+    File.Delete(temp);
 }
 
 var dir = Path.GetDirectoryName(asmPath)!;

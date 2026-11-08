@@ -553,13 +553,17 @@ addEventListener('resize', () => {
 
 if (navigator.xr) {
   navigator.xr.isSessionSupported('immersive-vr').then((ok) => {
+    // On a desktop the hint is the only place the controls are listed, so it has to keep
+    // saying them — the preview button opens this page with no headset anywhere in sight.
     document.getElementById('hint').textContent = ok
-      ? 'Headset detected — put it on and press Enter VR.'
-      : 'Browser has no WebXR device (this is expected on desktop).';
-    btn.disabled = false;
-  });
+      ? 'Headset detected — put it on and press Enter VR.  Desktop: WASD, drag to look, F to fly, R to respawn, C for colliders.'
+      : 'Desktop preview — WASD to walk, drag to look, F to fly, Q/E down and up, R to respawn, C for colliders.';
+    // Clicking Enter VR on a machine with no XR device can only fail, so don't invite it.
+    btn.disabled = !ok;
+  }).catch(() => { btn.disabled = false; });
 } else {
-  document.getElementById('hint').textContent = 'WebXR not available in this browser.';
+  document.getElementById('hint').textContent =
+    'No WebXR in this browser — desktop preview: WASD to walk, drag to look, F to fly, Q/E down and up, R to respawn, C for colliders.';
 }
 
 load().catch((e) => {

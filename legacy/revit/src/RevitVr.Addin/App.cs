@@ -85,6 +85,23 @@ public sealed class App : IExternalApplication
             ToolTip = "Re-open the last exported scene on the headset without re-exporting.",
         };
         panel.AddItem(reopen);
+
+        // A third: the same scene in this PC's browser, so the model can be checked before
+        // putting the headset on. Same viewer and same renderer — no second render path to trust.
+        var preview = new PushButtonData(
+            "RevitVrPreview",
+            "Preview\nDesktop",
+            asmPath,
+            typeof(PreviewCommand).FullName)
+        {
+            ToolTip = "Open the last exported scene in this PC's browser — no headset needed.",
+            LongDescription =
+                "Shows the exported scene with the viewer the headset uses, at desktop scale.\n" +
+                "WASD to walk, drag to look, F to fly, Q/E down and up, R to respawn, " +
+                "C to draw the colliders.\n" +
+                "Nothing is re-exported: press Enter VR first if the model has changed.",
+        };
+        panel.AddItem(preview);
     }
 
     public static string LogPath => Path.Combine(
@@ -122,16 +139,10 @@ public sealed class OpenViewerCommand : IExternalCommand
         // This command does not export: it re-opens whatever the last Enter VR left in the export
         // folder. Starting a server on an empty folder gives a page that dies on a 404 with no
         // hint about what to do, so check for a scene first and say what to press.
-        var exportDir = Export.Paths.ExportDir;
-        var scenePath = Path.Combine(exportDir, "scene.glb");
-        var colliderPath = Path.Combine(exportDir, "colliders.json");
-        if (!File.Exists(scenePath) || !File.Exists(colliderPath))
+        if (!Export.SceneFiles.Ready)
         {
             TaskDialog.Show("RevitVR",
-                "There is no exported scene to open yet.\n\n" +
-                "Open a 3D view and press Enter VR — that is what exports the model.\n" +
-                "Open Viewer only re-opens the scene the last export left behind:\n\n" +
-                exportDir);
+                Export.SceneFiles.NothingExported + "\n\n" + Export.SceneFiles.Dir);
             return Result.Cancelled;
         }
 
@@ -145,7 +156,7 @@ public sealed class OpenViewerCommand : IExternalCommand
         }
 
         var title = data.Application.ActiveUIDocument?.Document?.Title;
-        var scene = DescribeScene(colliderPath, title);
+        var scene = Export.SceneFiles.Describe(title);
 
         if (!deviceOk)
         {
@@ -188,50 +199,49 @@ public sealed class OpenViewerCommand : IExternalCommand
             launchMessage + "\n\n" + next);
         return Result.Failed;
     }
+}
 
+[Autodesk.Revit.Attributes.Transaction(Autodesk.Revit.Attributes.TransactionMode.ReadOnly)]
+public sealed class PreviewCommand : IExternalCommand
+{
     /// <summary>
-    /// Names the scene the server is about to serve, from the manifest beside it. Worth saying
-    /// because this command ignores which document is open: from project B it opens project A's
-    /// last export, which is otherwise indistinguishable from a stale view.
+    /// The same scene in this PC's browser, so the model can be looked at without the headset.
+    /// The viewer is the one the headset runs and the server is already http on loopback, so
+    /// this costs no second renderer — but it does mean the preview shows the *exported* scene,
+    /// not the live Revit model: press Enter VR first if the model has changed.
     /// </summary>
-    private static string DescribeScene(string colliderPath, string? openDocument)
+    public Result Execute(ExternalCommandData data, ref string message, ElementSet elements)
     {
-        try
+        if (!Export.SceneFiles.Ready)
         {
-            using var json = System.Text.Json.JsonDocument.Parse(File.ReadAllText(colliderPath));
-            var root = json.RootElement;
-
-            var name = root.TryGetProperty("name", out var n) ? n.GetString() : null;
-            var lines = new List<string>
-            {
-                "Scene: " + (string.IsNullOrWhiteSpace(name) ? "unnamed" : name),
-            };
-
-            if (root.TryGetProperty("generatedUtc", out var g) &&
-                DateTime.TryParse(g.GetString(), null,
-                    System.Globalization.DateTimeStyles.RoundtripKind, out var generated))
-            {
-                var local = generated.ToLocalTime();
-                lines.Add($"Exported: {local:yyyy-MM-dd HH:mm}" +
-                          (local.Date == DateTime.Today
-                              ? ""
-                              : " (not today — press Enter VR if the model has changed)"));
-            }
-
-            if (!string.IsNullOrWhiteSpace(name) &&
-                !string.IsNullOrWhiteSpace(openDocument) &&
-                !string.Equals(name, openDocument, StringComparison.OrdinalIgnoreCase))
-            {
-                lines.Add("");
-                lines.Add($"Note: this scene is from '{name}', not the open document '{openDocument}'.");
-            }
-
-            return string.Join("\n", lines) + "\n\n";
+            TaskDialog.Show("RevitVR",
+                Export.SceneFiles.NothingExported + "\n\n" + Export.SceneFiles.Dir);
+            return Result.Cancelled;
         }
-        catch
+
+        // lan:false — the browser is on this machine, so loopback over http needs no certificate
+        // and none of the adb work the headset path needs.
+        var port = Export.ExportJob.EnsureServer(lan: false, out var err);
+        if (port == 0)
         {
-            // The manifest is a nicety; never block the launch on it.
-            return "";
+            TaskDialog.Show("RevitVR", err ?? "Server did not start.");
+            return Result.Failed;
         }
+
+        var url = $"http://localhost:{port}/";
+        var scene = Export.SceneFiles.Describe(data.Application.ActiveUIDocument?.Document?.Title);
+
+        if (!Launch.Desktop.Open(url, out var openMessage))
+        {
+            TaskDialog.Show("RevitVR — preview did not open",
+                scene + "The server is up, but no browser could be launched:\n\n" +
+                openMessage + "\n\nOpen this yourself:\n" + url);
+            return Result.Failed;
+        }
+
+        // No dialog on success: the browser window is the confirmation, and the page itself lists
+        // the desktop controls. A modal box to dismiss would defeat the point of a quick look.
+        App.Log($"preview: {url}");
+        return Result.Succeeded;
     }
 }
