@@ -52,6 +52,9 @@ FLAT = 0.985              # n.z above this is a horizontal face
 UPRIGHT = 0.85            # n.z below this is a vertical face
 STEP_DROP = 0.47          # m — a slab edge this close to a floor below is a step
 OPENING_CLASSES = ("IfcDoor", "IfcWindow")
+# Layer names that mean "this is a way through", matched case-insensitively
+# as a substring, so Puertas / Ventanas / Doors-1 all count.
+OPENING_HINTS = ("door", "puerta", "window", "ventana", "opening", "hueco")
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +339,8 @@ def build_manifest(faces, *, name="IngeTrazo model", eye_height=EYE_HEIGHT,
     tris = 0
     solid_holes = 0
     step_edges = 0
+    opening_runs = 0
+    applied = []
 
     def in_opening(x, y):
         for (x0, y0, x1, y1) in openings:
@@ -416,7 +421,21 @@ def build_manifest(faces, *, name="IngeTrazo model", eye_height=EYE_HEIGHT,
             fb = _fallback_run(poly, opts)
             runs = [fb] if fb else []
         for q0, q1, y0, y1 in runs:
-            if openings and in_opening((q0[0] + q1[0]) / 2, (q0[1] + q1[1]) / 2):
+            why = None
+            if face.get("opening"):
+                why = "layer:" + (face.get("layer") or "?")
+            elif openings and in_opening((q0[0] + q1[0]) / 2,
+                                         (q0[1] + q1[1]) / 2):
+                why = "opening"
+            if why:
+                # recorded so the viewer can draw what the rule removed: the
+                # only way to tell a tag or a layer actually did something
+                a, b = _up(q0), _up(q1)
+                applied.append({"x1": round(a[0], 3), "z1": round(a[2], 3),
+                                "x2": round(b[0], 3), "z2": round(b[2], 3),
+                                "y0": round(y0, 3), "y1": round(y1, 3),
+                                "why": why})
+                opening_runs += 1
                 continue
             pieces = _wall_pieces(q0, q1, y0, y1, walk, opts["min_run_len"])
             if not pieces:
@@ -465,6 +484,8 @@ def build_manifest(faces, *, name="IngeTrazo model", eye_height=EYE_HEIGHT,
         "segments": segments,
         "surfaces": surfaces,
         "terrain": terrain,
+        "openings_applied": applied,
+        "opening_runs": opening_runs,
         "warnings": warnings,
     }
 
@@ -610,11 +631,89 @@ def _triangulate(face):
     return [[v[0], v[i], v[i + 1]] for i in range(1, len(v) - 1)]
 
 
-def collect_faces(scene):
+def _layer_of(entity):
+    """The layer name an entity carries, face or group."""
+    try:
+        from core.layers import layer_of
+        return layer_of(entity) or ""
+    except Exception:
+        attrs = getattr(entity, "attrs", None) or {}
+        return attrs.get("layer") or getattr(entity, "layer", None) or ""
+
+
+def _opening_hints(options):
+    raw = (options or {}).get("opening_layers")
+    if raw is None:
+        return list(OPENING_HINTS)
+    if isinstance(raw, str):
+        raw = raw.replace(";", ",").split(",")
+    return [str(x).strip().lower() for x in raw if str(x).strip()]
+
+
+def _is_opening_layer(name, hints):
+    n = (name or "").strip().lower()
+    return bool(n) and any(h in n for h in hints)
+
+
+def _group_opening_box(group):
+    """Plan bounding box of a group's geometry in world space, or None."""
+    from core.group import iter_placements
+    xs, ys = [], []
+    try:
+        placements = list(iter_placements(group))
+    except Exception:
+        placements = [(group, None)]
+    for piece, m in placements:
+        mesh = getattr(piece, "mesh", None)
+        if mesh is None:
+            continue
+        for v in mesh.vertices:
+            try:
+                p = v.position if m is None else m.map(v.position)
+            except Exception:
+                continue
+            xs.append(p.x())
+            ys.append(p.y())
+    if not xs:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _collect_group_openings(scene, hints):
+    """Plan boxes of every group whose layer says "way through", however deep.
+
+    IngeTrazo has no door objects: a door is faces, possibly grouped, possibly a
+    component instance. The layer sits on the group, so the group's own geometry
+    is what has to be excluded — and nested groups and component children are
+    walked, not just the top level.
+    """
+    boxes, names, seen = [], {}, set()
+    stack = list(getattr(scene, "groups", []) or [])
+    while stack:
+        g = stack.pop()
+        if id(g) in seen:
+            continue
+        seen.add(id(g))
+        lay = _layer_of(g)
+        if _is_opening_layer(lay, hints):
+            box = _group_opening_box(g)
+            if box:
+                boxes.append(box)
+                names[lay] = names.get(lay, 0) + 1
+        stack.extend(getattr(g, "children", None) or ())
+    return boxes, names
+
+
+def collect_faces(scene, options=None):
     """World-space faces for the collider pass, plus the opening boxes.
 
-    Returns ``(faces, openings, notes)``. Reads only — no undo step, no
+    Returns ``(faces, openings, notes, stats)``. Reads only — no undo step, no
     scene-changed notification.
+
+    An opening is geometry you can walk through: anything tagged IfcDoor /
+    IfcWindow, and anything on a layer whose name reads like one (see
+    ``OPENING_HINTS``). Both are optional — a hole in the wall that reaches the
+    floor is already a doorway without either.
 
     The API differs between the 0.3.x install and the current source:
     ``world_faces_painted`` and ``export_triangles`` are newer, so both are
@@ -628,9 +727,11 @@ def collect_faces(scene):
     else:
         walker = ((f, getattr(f, "attrs", {}) or {}) for f in mx.world_faces(scene))
     tri_fn = getattr(mx, "export_triangles", None)
+    hints = _opening_hints(options)
 
     faces, openings, notes = [], [], []
     tagged = 0
+    layer_faces, layer_groups = {}, {}
     for face, _attrs in walker:
         if getattr(face, "interior", False):
             continue                     # inside a solid, not a boundary
@@ -659,6 +760,10 @@ def collect_faces(scene):
         cls = tag.get("class", "") if isinstance(tag, dict) else ""
         if cls:
             tagged += 1
+        lay = _layer_of(face)
+        is_opening = _is_opening_layer(lay, hints)
+        if is_opening:
+            layer_faces[lay] = layer_faces.get(lay, 0) + 1
         tris = None
         # Only faces that need triangles pay for them: sloped ground, and a
         # floor with an opening that must stay a hole you can fall through.
@@ -671,7 +776,7 @@ def collect_faces(scene):
             except Exception:
                 tris = None
         faces.append({"poly": poly, "holes": holes, "normal": nrm, "area": area,
-                      "cls": cls,
+                      "cls": cls, "layer": lay, "opening": is_opening,
                       "interior": bool(getattr(face, "interior", False)),
                       "tris": tris})
 
@@ -691,10 +796,17 @@ def collect_faces(scene):
             openings.append((min(xs), min(ys), max(xs), max(ys)))
     except Exception as exc:                    # never lose the export to this
         notes.append(f"BIM tags unreadable ({exc}) — doors are not opened")
-    if tagged == 0:
-        notes.append("no BIM tags in this model — openings come from geometry "
-                     "only (a hole that reaches the floor is a doorway)")
-    return faces, openings, notes
+
+    # Faces carry a layer of their own, but a group carries one for its whole
+    # set of faces — and that is how a modelled "door" is most likely labelled.
+    group_boxes, layer_groups = _collect_group_openings(scene, hints)
+    openings.extend(group_boxes)
+
+    ifc_openings = len(openings) - sum(layer_groups.values())
+    stats = {"tagged": tagged, "ifc_openings": ifc_openings,
+             "layer_faces": layer_faces, "layer_groups": layer_groups,
+             "hints": hints}
+    return faces, openings, notes, stats
 
 
 def document_name(viewport):
@@ -799,10 +911,22 @@ def export(scene, *, name=None, write_glb=True, options=None):
         except Exception as exc:
             notes.append(f"could not check the GLB's image types ({exc})")
 
-    faces, openings, read_notes = collect_faces(scene)
+    faces, openings, read_notes, stats = collect_faces(scene, options)
     notes += read_notes
     manifest = build_manifest(faces, name=name or "IngeTrazo model",
                               openings=openings, options=options)
+    n_layer = sum(stats["layer_groups"].values()) + len(stats["layer_faces"])
+    names = sorted(set(list(stats["layer_groups"]) + list(stats["layer_faces"])))
+    if stats["ifc_openings"] or n_layer:
+        notes.append(
+            f"openings: {stats['ifc_openings']} tagged IfcDoor/IfcWindow"
+            + (f", {n_layer} on layer(s) {', '.join(names)}" if n_layer else ""))
+    else:
+        notes.append("openings: none — tag the door IfcDoor/IfcWindow, or put it "
+                     "on a layer whose name contains "
+                     + ", ".join(stats["hints"]))
+    notes.append(f"{manifest['opening_runs']} wall run(s) dropped as openings")
+
     with open(out / "colliders.json", "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, separators=(",", ":"))
     manifest["_notes"] = notes + manifest["warnings"]
@@ -1116,8 +1240,8 @@ def _make_dialog(viewport):
     from PySide6.QtCore import QUrl
     from PySide6.QtGui import QDesktopServices
     from PySide6.QtWidgets import (QCheckBox, QDialog, QHBoxLayout, QLabel,
-                                   QMessageBox, QPlainTextEdit, QPushButton,
-                                   QSpinBox, QVBoxLayout)
+                                   QLineEdit, QMessageBox, QPlainTextEdit,
+                                   QPushButton, QSpinBox, QVBoxLayout)
 
     class VrDialog(QDialog):
         def __init__(self):
@@ -1141,6 +1265,15 @@ def _make_dialog(viewport):
             self.port_spin.setRange(1024, 65535)
             self.port_spin.setValue(DEFAULT_PORT)
             row.addWidget(self.port_spin)
+            self.opening_layers = QLineEdit(", ".join(OPENING_HINTS))
+            self.opening_layers.setToolTip(
+                "Geometry on a layer whose name contains any of these is a way "
+                "through, like a face tagged IfcDoor.")
+            lay_row = QHBoxLayout()
+            lay_row.addWidget(QLabel("Opening layers"))
+            lay_row.addWidget(self.opening_layers, stretch=1)
+            lay.addLayout(lay_row)
+
             self.untagged = QCheckBox("Untagged geometry blocks too")
             self.untagged.setChecked(True)
             self.untagged.setToolTip(
@@ -1177,7 +1310,8 @@ def _make_dialog(viewport):
             self.repaint()
             try:
                 m = export(viewport.scene, name=document_name(viewport),
-                           options={"walls": self.untagged.isChecked()})
+                           options={"walls": self.untagged.isChecked(),
+                                    "opening_layers": self.opening_layers.text()})
             except Exception as exc:
                 self.log.setPlainText(f"export failed: {exc}")
                 QMessageBox.warning(self, "IngeTrazo VR", f"Export failed:\n{exc}")

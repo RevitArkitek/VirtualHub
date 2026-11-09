@@ -68,6 +68,7 @@ collision engine believes:
 | Colour | Meaning |
 |---|---|
 | **Green** | a **walkable surface** — every floor polygon and terrain triangle you can stand on, at its height |
+| **Magenta** | a wall run the exporter **removed as an opening**, drawn where it was removed — so a door tag or layer proves itself |
 | Red | railing |
 | Blue | wall |
 | Amber | furniture, casework, columns, and any short barrier |
@@ -93,12 +94,28 @@ not a wall object with a location curve. So the colliders come from the geometry
 | a hole in that face that reaches the floor | the run is **split** — that is a doorway |
 | a hole that stops above the floor | the run stays whole — that is a window |
 | a face ≤ 1.0 m tall whose top meets a walkable surface (a floor polygon **or a terrain triangle** — a stairwell floor is triangulated), with another walkable surface within 0.47 m below that top | **not a wall: a slab edge over a step.** The qualifying part of the run is dropped, so a floor's edge at the head of a stair is stepped onto instead of blocking |
-| a face tagged `IfcDoor` / `IfcWindow` | dropped as an obstacle, and any wall run inside its plan extent goes too |
+| a face (or a group, at any depth) tagged `IfcDoor` / `IfcWindow`, **or on a layer whose name contains** door / puerta / window / ventana / opening / hueco | its own vertical faces stop being walls, and any wall run whose midpoint falls inside its plan box is dropped too. The layer list is editable in the export dialog, matched case-insensitively as a substring, so `Puertas`, `DOORS-1`, `Ventanas PB` all count |
 | faces under 0.25 m long, 0.55 m tall, 0.04 m² | ignored (skirting, jambs, trim) |
 | hidden objects and layers | not exported — `world_faces` respects visibility, as `save_glb` does |
 
 Faces are read in world space with their paint resolved, so a component's instances arrive
 placed correctly.
+
+**There are no door objects to find.** IngeTrazo gives you faces, groups/components that hold
+faces, and labels you attach to either — a layer, or an IFC class. So a "door" here is whatever
+geometry you modelled, plus a label if you added one. The plugin reads it that way:
+
+- **geometry** decides the walkable world — floors, treads, walls, and the holes that reach the
+  floor, which are doorways with no label at all;
+- **labels** only stop the door's own faces from being walls. If your opening is a real hole,
+  tagging or layering the leaf changes nothing you can see.
+
+A layer can sit on a **face** (`attrs["layer"]`, kept through component transforms and merged
+meshes) or on a **group** (`group.layer`), and the group walk is recursive, so a leaf inside a
+wall group is found when the leaf's own group carries the layer.
+
+Nothing resolves a "door" into a cut in a wall the way Revit does: if the wall has no hole, no
+tag or layer opens it.
 
 **Spawn:** on the model's own lowest level, at the point with the most clearance from any
 wall, facing the most open direction. If the base has nowhere roomy to stand (a monument, a

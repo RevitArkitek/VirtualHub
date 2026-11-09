@@ -33,6 +33,21 @@ base.Tool = Tool
 sys.modules["tools"] = tools
 sys.modules["tools.base"] = base
 
+# ---- stub core.group.iter_placements, mirroring the 0.3.x implementation ----
+core = types.ModuleType("core")
+core_group = types.ModuleType("core.group")
+
+
+def _iter_placements(group, base=None):
+    yield group, base
+    for child in getattr(group, "children", None) or ():
+        yield from _iter_placements(child, base)
+
+
+core_group.iter_placements = _iter_placements
+sys.modules["core"] = core
+sys.modules["core.group"] = core_group
+
 spec = importlib.util.spec_from_file_location("ingetrazo_vr", ROOT / "ingetrazo_vr.py")
 vr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vr)
@@ -243,6 +258,83 @@ check("the floor is terrain, not a surface",
       and len(m["terrain"]) >= 2, (len(m["surfaces"]), len(m["terrain"])))
 check("its slab edge is walked as a step", m["segments"] == [], m["segments"])
 check("and reported", any("slab edge" in w for w in m["warnings"]), m["warnings"])
+
+print("16. a face on a door layer is an opening, not a wall")
+door_leaf = wall((2.0, 0.0), (2.9, 0.0), 0.0, 2.1)
+door_leaf["layer"] = "Puertas"
+door_leaf["opening"] = True
+m = vr.build_manifest([floor(0, 0, 10, 4, 0),
+                       wall((0, 0), (10, 0), 0, 2.8,
+                            holes=[rect_hole(2.0, -0.1, 2.9, 0.1, 0.0, 2.1)]),
+                       door_leaf])
+check("the leaf on the door layer adds no collider",
+      not cover(m["segments"], "x", 2.05, 2.85, 0.0), m["segments"])
+check("and the removal is recorded",
+      any(o["y1"] > 2.0 for o in m["openings_applied"]), m["openings_applied"])
+check("the wall either side still blocks",
+      cover(m["segments"], "x", 0.5, 1.5, 0.0) and cover(m["segments"], "x", 4.0, 9.0, 0.0))
+
+print("17. a face on an ordinary layer still blocks")
+leaf2 = wall((2.0, 0.0), (2.9, 0.0), 0.0, 2.1)
+leaf2["layer"] = "Muros"
+leaf2["opening"] = False
+m = vr.build_manifest([floor(0, 0, 10, 4, 0), leaf2])
+check("layer Muros is not an opening", len(m["segments"]) == 1, m["segments"])
+check("nothing recorded as an opening", m["openings_applied"] == [],
+      m["openings_applied"])
+
+print("18. layer matching is a case-insensitive substring, and configurable")
+check("Puerta PB matches", vr._is_opening_layer("Puerta PB", vr.OPENING_HINTS))
+check("DOORS-1 matches", vr._is_opening_layer("DOORS-1", vr.OPENING_HINTS))
+check("Muros does not", not vr._is_opening_layer("Muros", vr.OPENING_HINTS))
+check("a custom hint list is used",
+      vr._is_opening_layer("xx", ["xx"]) and
+      not vr._is_opening_layer("Puerta", ["xx"]))
+
+print("19. group layers are read from the group, nested ones included")
+
+
+class _V:
+    def __init__(self, x, y):
+        self.position = self
+        self._x, self._y = x, y
+
+    def x(self):
+        return self._x
+
+    def y(self):
+        return self._y
+
+
+class _Mesh:
+    def __init__(self, pts):
+        self.vertices = [_V(x, y) for x, y in pts]
+
+
+class _Group:
+    def __init__(self, layer, pts, children=()):
+        self.layer = layer
+        self.mesh = _Mesh(pts)
+        self.children = list(children)
+
+
+class _Scene:
+    def __init__(self, groups):
+        self.groups = groups
+
+
+nested = _Group("Puertas", [(2.0, 0.0), (2.9, 0.1)])          # inside the wall
+wall_group = _Group("Muros", [(0.0, 0.0), (10.0, 0.0)], children=[nested])
+window_group = _Group("Ventanas", [(5.0, -0.1), (5.8, 0.1)])
+plain = _Group("Muros", [(0.0, 4.0), (10.0, 4.0)])
+boxes, names = vr._collect_group_openings(
+    _Scene([wall_group, window_group, plain]), vr.OPENING_HINTS)
+check("two groups matched", len(boxes) == 2, boxes)
+check("the nested one counts", names.get("Puertas") == 1, names)
+check("the top-level one counts", names.get("Ventanas") == 1, names)
+check("its box is its own geometry, not the parent's",
+      any(abs(b[0] - 2.0) < 1e-6 and abs(b[2] - 2.9) < 1e-6 for b in boxes), boxes)
+check("a Muros group is not an opening", "Muros" not in names, names)
 
 print()
 if fails:

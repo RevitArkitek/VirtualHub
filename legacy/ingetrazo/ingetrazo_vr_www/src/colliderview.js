@@ -22,6 +22,10 @@ const KINDS = {
 // Where you can stand is drawn as a green plane: a floor polygon, or a terrain
 // triangle (a floor with a stairwell hole is triangulated, so that is where the
 // storey above a stair actually lives).
+// A wall run the exporter dropped because a tag or a layer said "opening".
+// Drawn so a tag that did nothing, or one that ate a wall, is visible.
+const OPENED = { color: 0xff4de0, opacity: 0.34 };
+
 const GROUND = {
   surface: { color: 0x35d05a, opacity: 0.18 },
   terrain: { color: 0x1f9e44, opacity: 0.22 },
@@ -177,6 +181,39 @@ export function buildColliderView(segments, options = {}) {
     group.add(mesh);
   }
 
+  // Magenta boxes: wall runs removed as openings, so a door tag or layer you
+  // just applied proves itself (or shows it removed the wrong thing).
+  const opened = options.openings || [];
+  if (opened.length) {
+    const material = new THREE.MeshBasicMaterial({
+      color: OPENED.color,
+      transparent: true,
+      opacity: OPENED.opacity,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      toneMapped: false,
+    });
+    const mesh = new THREE.InstancedMesh(unit, material, opened.length);
+    mesh.name = 'colliders-openings';
+    mesh.frustumCulled = false;
+    mesh.renderOrder = 1000;
+    opened.forEach((o, i) => {
+      const dx = o.x2 - o.x1;
+      const dz = o.z2 - o.z1;
+      const length = Math.hypot(dx, dz);
+      euler.set(0, Math.atan2(-dz, dx), 0);
+      quat.setFromEuler(euler);
+      pos.set((o.x1 + o.x2) / 2, ((o.y0 ?? 0) + (o.y1 ?? 0)) / 2,
+              (o.z1 + o.z2) / 2);
+      scale.set(Math.max(length, 0.05),
+                Math.max((o.y1 ?? 0) - (o.y0 ?? 0), 0.05), 0.12);
+      matrices.compose(pos, quat, scale);
+      mesh.setMatrixAt(i, matrices);
+    });
+    mesh.instanceMatrix.needsUpdate = true;
+    group.add(mesh);
+  }
+
   // Green planes: where the collision engine will let you stand. Pass
   // `surfaces` and `terrain` from the manifest to see them.
   const surfaces = options.surfaces || [];
@@ -191,6 +228,7 @@ export function buildColliderView(segments, options = {}) {
   group.userData.count = (segments || []).filter((s) => s.solid !== false).length;
   group.userData.surfaces = surfaces.length;
   group.userData.terrain = terrain.length;
+  group.userData.openings = opened.length;
   group.userData.kinds = [...buckets.keys()];
   return group;
 }

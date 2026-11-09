@@ -426,6 +426,7 @@ async function load() {
   app.colliderView = buildColliderView(manifest.segments, {
     surfaces: manifest.surfaces,
     terrain: manifest.terrain,
+    openings: manifest.openings_applied,
   });
   app.colliderView.visible = false;
   app.scene.add(app.colliderView);
