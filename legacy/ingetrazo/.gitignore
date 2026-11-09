@@ -7,3 +7,4 @@ runtime-*.json
 cert.pem
 key.pem
 cert.json
+.vs/
