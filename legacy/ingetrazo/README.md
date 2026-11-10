@@ -80,6 +80,34 @@ surface and a depth-tested decal disappears under the model's own floor exactly 
 see it. The boxes stay depth-tested, so walls still occlude properly.
 Port 8770 by default, so it can run beside RevitVR's 8765.
 
+## Performance
+
+A model is exported with one node per group and per instance, and the viewer draws one mesh per
+node. On a real site that arrived as **18,587 meshes holding 874k triangles** — 18k draw calls
+per eye, per frame. A desktop GPU absorbs that; a headset does not, which is the whole
+"fine on the PC, crawling in VR" difference.
+
+So the viewer collapses the scene after loading: meshes are merged by material and by 30 m plan
+cell, keeping frustum culling useful. Measured in Chrome on the same export, same camera:
+
+| | meshes | ms per render |
+|---|---|---|
+| as exported | 18,587 | 87.96 |
+| collapsed | 269 | 2.56 |
+
+Add `?collapse=0` to the URL to see the difference for yourself — it skips the merge.
+
+Two more knobs, both URL parameters, neither on by default:
+
+- `?scale=0.8` — renders the headset at 80% linear resolution (`renderer.xr.setFramebufferScaleFactor`).
+  The cheapest frame rate there is, paid for in softness. Range 0.4–1.5.
+- `C` in the headset draws the collider world, including the green ground planes, which are
+  deliberately not depth-tested. It costs overdraw — leave it off while you walk and switch it on
+  to check something.
+
+The collision world is not the bottleneck on this model: `groundAt` measured 0.016 ms per call
+with 6,440 surfaces, and `resolve` rounds to 0 ms with 18,721 segments behind the spatial hash.
+
 ## How the collision world is derived
 
 IngeTrazo has no parametric walls, doors or railings — a BIM tag is metadata on a face set,

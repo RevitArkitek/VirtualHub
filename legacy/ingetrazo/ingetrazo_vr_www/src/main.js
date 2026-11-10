@@ -2,6 +2,71 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { CollisionWorld } from './collision.js';
 import { buildColliderView } from './colliderview.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+/**
+ * Collapse a glTF's node graph into a few merged meshes.
+ *
+ * IngeTrazo writes a node per group and per instance, so one real site arrived
+ * as 18,587 meshes holding 874k triangles. Every mesh is a draw call, per eye,
+ * per frame — that is what makes a headset crawl while a desktop shrugs it off.
+ * Merging by material and by plan cell brings the draw count down to the tens
+ * and still leaves frustum culling something to do.
+ */
+function collapseMeshes(root, chunk = 30) {
+  root.updateMatrixWorld(true);
+  const buckets = new Map();
+  root.traverse((o) => {
+    if (!o.isMesh || Array.isArray(o.material)) return;
+    if (!o.geometry || !o.geometry.attributes.position) return;
+    const p = new THREE.Vector3().setFromMatrixPosition(o.matrixWorld);
+    const attrs = Object.keys(o.geometry.attributes).sort().join(',');
+    const key = [o.material.uuid,
+                 Math.floor(p.x / chunk), Math.floor(p.z / chunk),
+                 o.geometry.index ? 'i' : 'n', attrs].join('|');
+    let list = buckets.get(key);
+    if (!list) buckets.set(key, (list = []));
+    list.push(o);
+  });
+
+  const out = new THREE.Group();
+  out.name = 'model';
+  for (const list of buckets.values()) {
+    const geos = list.map((o) => {
+      const g = o.geometry.clone();
+      g.applyMatrix4(o.matrixWorld);
+      return g;
+    });
+    let merged = null;
+    if (geos.length > 1) {
+      try {
+        merged = mergeGeometries(geos, false);
+      } catch (e) {
+        merged = null;
+      }
+    } else {
+      merged = geos[0];
+    }
+    if (!merged) {                        // incompatible after all: keep them apart
+      for (const g of geos) {
+        if (g !== merged) g.dispose();
+      }
+      for (const o of list) {
+        const m = new THREE.Mesh(o.geometry.clone(), o.material);
+        m.applyMatrix4(o.matrixWorld);
+        out.add(m);
+      }
+      continue;
+    }
+    geos.forEach((g) => {
+      if (g !== merged) g.dispose();
+    });
+    merged.computeBoundingSphere();
+    merged.computeBoundingBox();
+    out.add(new THREE.Mesh(merged, list[0].material));
+  }
+  return out;
+}
 
 const UP = new THREE.Vector3(0, 1, 0);
 const RADIUS = 0.20;       // player capsule radius, metres. 0.30 was too fat once railing colliders landed on the stairs: on a 0.9 m flight it left a 0.2 m corridor, so you could not climb. 0.20 leaves ~0.65 m on the same stair.
@@ -41,6 +106,14 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 // The scene is static, so the shadow map is rendered once and then frozen.
 renderer.shadowMap.autoUpdate = false;
 renderer.xr.enabled = true;
+// ?scale=0.8 renders the headset at 80% linear resolution: the cheapest frame
+// rate you can buy, paid for in softness. Default is the browser's own choice.
+{
+  const wanted = parseFloat(new URLSearchParams(location.search).get('scale') || '');
+  if (Number.isFinite(wanted) && wanted >= 0.4 && wanted <= 1.5) {
+    renderer.xr.setFramebufferScaleFactor(wanted);
+  }
+}
 renderer.xr.setReferenceSpaceType('local-floor');
 
 // ---------------------------------------------------------------- lighting
@@ -442,8 +515,16 @@ async function load() {
   }
 
   const gltf = await new GLTFLoader().loadAsync('./scene/scene.glb');
+  // ?collapse=0 keeps the exporter's node graph, for measuring what merging buys
+  const doCollapse = new URLSearchParams(location.search).get('collapse') !== '0';
+  const model = doCollapse ? collapseMeshes(gltf.scene, 30) : gltf.scene;
+  if (doCollapse) {
+    gltf.scene.traverse((o) => {
+      if (o.isMesh && o.geometry) o.geometry.dispose(); // the merged copies live on
+    });
+  }
   let tris = 0;
-  gltf.scene.traverse((o) => {
+  model.traverse((o) => {
     if (o.isMesh) {
       o.frustumCulled = true;
       o.castShadow = true;
@@ -476,10 +557,10 @@ async function load() {
     }
   });
   app.stats.tris = Math.round(tris);
-  app.scene.add(gltf.scene);
+  app.scene.add(model);
 
   // fit the single shadow map to the model, then freeze it
-  const box = new THREE.Box3().setFromObject(gltf.scene);
+  const box = new THREE.Box3().setFromObject(model);
   if (!box.isEmpty()) {
     const c = box.getCenter(new THREE.Vector3());
     const size = Math.min(box.getSize(new THREE.Vector3()).length(), 80);
@@ -504,6 +585,7 @@ async function load() {
 function debugApi() {
   return {
     app,
+    renderer,
     get position() { return app.rig.position.clone(); },
     setPose(x, z, yawDeg = 0, y = null) {
       app.rig.position.set(x, y ?? app.rig.position.y, z);
