@@ -71,6 +71,7 @@ Controls:
 | **Right grip** | **toggle walk / fly** |
 | Left grip | show the collision world |
 | **Either trigger (hold)** | **fast navigation: 3× movement, walking or flying** |
+| **Both triggers (hold)** | **double boost: 6× — twice the single-trigger boost** |
 | Desktop | WASD, drag to look, `F` fly, `Q`/`E` down/up, `Shift` run, `R` respawn, `C` colliders |
 
 The export runs on the GUI thread and reads only; it never adds an undo step or marks the

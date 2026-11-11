@@ -86,7 +86,8 @@ const WALK = 1.65;         // m/s
 const RUN = 3.4;
 const SNAP = Math.PI / 6;  // 30 degrees
 const DEAD = 0.18;
-const BOOST = 3.0;         // either trigger held: movement speed multiplier (walk, fly, climb)
+const BOOST = 3.0;         // one trigger held: movement speed multiplier (walk, fly, climb)
+const BOOST2 = 6.0;        // both triggers held — double boost: twice the boost multiplier
 
 const app = {
   ready: false,
@@ -357,11 +358,11 @@ function flash(t) {
  * Applies one movement step. Kept separate from the render loop so the headless
  * test harness can drive it deterministically.
  *
- * `boost` is the fast-navigation multiplier (either trigger held) and scales every axis that
- * moves the rig — travel and climb alike — but never the snap turn, which stays one 30°
- * step so fast navigation cannot spin someone by accident.
+ * `boost` is the fast-navigation level: 0 with no trigger, 1 with either trigger, 2 with both
+ * (double boost). It scales every axis that moves the rig — travel and climb alike — but never
+ * the snap turn, which stays one 30° step so fast navigation cannot spin someone by accident.
  */
-function step(dt, wish, turn, boost = false) {
+function step(dt, wish, turn, boost = 0) {
   if (!app.world) return;
 
   // horizontal basis from where the head is actually looking
@@ -371,7 +372,8 @@ function step(dt, wish, turn, boost = false) {
   dir.normalize();
   const right = tmpV2.crossVectors(dir, UP).normalize();
 
-  const speed = ((keys.has('ShiftLeft') || keys.has('ShiftRight')) ? RUN : WALK) * (boost ? BOOST : 1);
+  const mult = boost >= 2 ? BOOST2 : boost >= 1 ? BOOST : 1;
+  const speed = ((keys.has('ShiftLeft') || keys.has('ShiftRight')) ? RUN : WALK) * mult;
   const dx = (dir.x * wish.y + right.x * wish.x) * speed * dt;
   const dz = (dir.z * wish.y + right.z * wish.x) * speed * dt;
 
@@ -440,14 +442,16 @@ function readThumbsticks(sources = renderer.xr.getSession()?.inputSources ?? [])
   let wish = { x: 0, y: 0 };
   let turn = 0;
   let rightY = 0;   // right stick Y, forward positive. Fly mode: the climb axis.
-  let boost = false;   // either trigger held: fast navigation
+  let triggers = 0;  // index triggers held, across both hands
   for (const src of sources) {
     const gp = src.gamepad;
-    if (!gp || !gp.axes || gp.axes.length < 4) continue;
-    const ax = gp.axes[2], ay = gp.axes[3];
+    if (!gp) continue;
     // Either index trigger is the fast-navigation boost: xr-standard button 0 on both hands,
-    // so the left one keeps working and the right one joins it.
-    if (gp.buttons && gp.buttons[0] && gp.buttons[0].pressed) boost = true;
+    // so the left one keeps working and the right one joins it. Count them instead of OR-ing
+    // so that both at once — the double boost — can be told apart from one.
+    if (gp.buttons && gp.buttons[0] && gp.buttons[0].pressed) triggers++;
+    if (!gp.axes || gp.axes.length < 4) continue;
+    const ax = gp.axes[2], ay = gp.axes[3];
     if (src.handedness === 'right') {
       // Climb and snap turn are independent: the stick can do both at once, so the turn latch
       // gates the turn only and never the Y axis.
@@ -467,7 +471,8 @@ function readThumbsticks(sources = renderer.xr.getSession()?.inputSources ?? [])
       if (Math.abs(ax) >= DEAD || Math.abs(ay) >= DEAD) wish = { x: ax, y: -ay };
     }
   }
-  return { wish, turn, rightY, boost };
+  // Level, not a flag: 1 trigger = boost, 2 = double boost.
+  return { wish, turn, rightY, boost: Math.min(triggers, 2) };
 }
 
 // ---------------------------------------------------------------- loop
@@ -651,8 +656,8 @@ function debugApi() {
      * Push the thumbsticks through the real readThumbsticks() → step() path with no headset.
      * `right` is the right stick's X axis, `left` is [x, y]; opts: `rightY` (right stick Y,
      * forward positive), `trigger` (left index trigger held), `rightTrigger` (right index
-     * trigger held), `dt`. Call with right = 0 to release the snap-turn latch, as letting go
-     * of the stick does.
+     * trigger held — both together is the double boost), `dt`. Call with right = 0 to release
+     * the snap-turn latch, as letting go of the stick does.
      */
     simulateStick(right = 0, left = [0, 0],
                   { dt = 1 / 72, rightY = 0, trigger = false, rightTrigger = false } = {}) {
