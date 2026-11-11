@@ -75,7 +75,7 @@ const WALK = 1.65;         // m/s
 const RUN = 3.4;
 const SNAP = Math.PI / 6;  // 30 degrees
 const DEAD = 0.18;
-const BOOST = 3.0;         // left trigger held: movement speed multiplier (walk, fly, climb)
+const BOOST = 3.0;         // either trigger held: movement speed multiplier (walk, fly, climb)
 
 const app = {
   ready: false,
@@ -217,14 +217,13 @@ for (let i = 0; i < 2; i++) {
   );
   c.add(line);
   c.addEventListener('connected', (e) => { c.userData.handedness = e.data.handedness; });
-  c.addEventListener('selectstart', () => {
-    if (c.userData.handedness === 'right') toggleFly();
-  });
 
-  // left grip, not the trigger: the left trigger is held for boost, so a press-to-toggle there
-  // fought with locomotion. The grip is the one input nothing else uses during a walkthrough.
+  // Grips: right toggles walk/fly, left toggles the collider world. The trigger used to
+  // toggle fly, but both triggers are the boost button now, so a press-to-toggle there would
+  // fight with locomotion — the grip is the one input nothing else holds.
   c.addEventListener('squeezestart', () => {
-    if (c.userData.handedness === 'left') toggleColliders();
+    if (c.userData.handedness === 'right') toggleFly();
+    else if (c.userData.handedness === 'left') toggleColliders();
   });
   app.rig.add(c);
   controllers.push(c);
@@ -331,7 +330,7 @@ function flash(t) {
  * Applies one movement step. Kept separate from the render loop so the headless
  * test harness can drive it deterministically.
  *
- * `boost` is the fast-navigation multiplier (left trigger held) and scales every axis that
+ * `boost` is the fast-navigation multiplier (either trigger held) and scales every axis that
  * moves the rig — travel and climb alike — but never the snap turn, which stays one 30°
  * step so fast navigation cannot spin someone by accident.
  */
@@ -414,11 +413,14 @@ function readThumbsticks(sources = renderer.xr.getSession()?.inputSources ?? [])
   let wish = { x: 0, y: 0 };
   let turn = 0;
   let rightY = 0;   // right stick Y, forward positive. Fly mode: the climb axis.
-  let boost = false;   // left trigger held: fast navigation
+  let boost = false;   // either trigger held: fast navigation
   for (const src of sources) {
     const gp = src.gamepad;
     if (!gp || !gp.axes || gp.axes.length < 4) continue;
     const ax = gp.axes[2], ay = gp.axes[3];
+    // Either index trigger is the fast-navigation boost: xr-standard button 0 on both hands,
+    // so the left one keeps working and the right one joins it.
+    if (gp.buttons && gp.buttons[0] && gp.buttons[0].pressed) boost = true;
     if (src.handedness === 'right') {
       // Climb and snap turn are independent: the stick can do both at once, so the turn latch
       // gates the turn only and never the Y axis.
@@ -434,9 +436,7 @@ function readThumbsticks(sources = renderer.xr.getSession()?.inputSources ?? [])
         app.yawLatch = Math.sign(ax);
       }
     } else {
-      // Left hand — and any source the runtime does not label — travels the rig, and its
-      // index trigger (xr-standard button 0) is the fast-navigation boost.
-      if (gp.buttons && gp.buttons[0] && gp.buttons[0].pressed) boost = true;
+      // Left hand — and any source the runtime does not label — travels the rig.
       if (Math.abs(ax) >= DEAD || Math.abs(ay) >= DEAD) wish = { x: ax, y: -ay };
     }
   }
@@ -615,13 +615,15 @@ function debugApi() {
     /**
      * Push the thumbsticks through the real readThumbsticks() → step() path with no headset.
      * `right` is the right stick's X axis, `left` is [x, y]; opts: `rightY` (right stick Y,
-     * forward positive), `trigger` (left index trigger held), `dt`. Call with right = 0 to
-     * release the snap-turn latch, as letting go of the stick does.
+     * forward positive), `trigger` (left index trigger held), `rightTrigger` (right index
+     * trigger held), `dt`. Call with right = 0 to release the snap-turn latch, as letting go
+     * of the stick does.
      */
-    simulateStick(right = 0, left = [0, 0], { dt = 1 / 72, rightY = 0, trigger = false } = {}) {
+    simulateStick(right = 0, left = [0, 0],
+                  { dt = 1 / 72, rightY = 0, trigger = false, rightTrigger = false } = {}) {
       const sources = [
         { handedness: 'left', gamepad: { axes: [0, 0, left[0], left[1]], buttons: [{ pressed: trigger }] } },
-        { handedness: 'right', gamepad: { axes: [0, 0, right, rightY], buttons: [{ pressed: false }] } },
+        { handedness: 'right', gamepad: { axes: [0, 0, right, rightY], buttons: [{ pressed: rightTrigger }] } },
       ];
       const { wish, turn, rightY: climb, boost } = readThumbsticks(sources);
       if (app.fly) step(dt, { x: wish.x, y: wish.y, fly: climb }, turn, boost);

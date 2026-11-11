@@ -56,13 +56,25 @@ certificate covering this PC's address (regenerated when the address changes). T
 *Advanced ▸ Proceed* once on the headset; after that Enter VR works. The page says so itself
 in a banner when opened over plain http.
 
+Controls:
+
+| | |
+|---|---|
+| Left stick | walk |
+| Right stick left/right | snap turn, 30° per push — let it spring back before the next step |
+| Right stick up/down | climb / descend while flying |
+| **Right grip** | **toggle walk / fly** |
+| Left grip | show the collision world |
+| **Either trigger (hold)** | **fast navigation: 3× movement, walking or flying** |
+| Desktop | WASD, drag to look, `F` fly, `Q`/`E` down/up, `Shift` run, `R` respawn, `C` colliders |
+
 The export runs on the GUI thread and reads only; it never adds an undo step or marks the
 document dirty. Running the server is a background thread that touches the export directory,
 never the document.
 
 Where things go: `%LOCALAPPDATA%\IngeTrazo\VR\export\scene.glb` and `colliders.json`.
 
-Press `C` (left-controller trigger in VR, or open the page with `?colliders`) to see what the
+Press `C` (left grip in VR, or open the page with `?colliders`) to see what the
 collision engine believes:
 
 | Colour | Meaning |
