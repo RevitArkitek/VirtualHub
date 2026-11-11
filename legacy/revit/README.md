@@ -209,6 +209,7 @@ rather than opening a second server.
 | Right grip | toggle walk / fly |
 | Left grip | show the collision world |
 | Either trigger (hold) | fast navigation: 3× movement speed while held — walking, flying and climbing; snap turn stays 30° |
+| Both triggers (hold) | double boost: 6× — twice the single-trigger boost |
 | While flying | left stick ↑↓ forward/back, ←→ strafe — same as walking. Right stick ↑↓ climbs (push forward) / descends (pull back), ←→ still snap turns |
 | Desktop | WASD, drag to look, `F` fly, `Q`/`E` down/up, `R` respawn, `C` colliders |
 | Both | **‹ Library** in the top bar returns to the model list (it ends the XR session first) |
@@ -217,7 +218,7 @@ rather than opening a second server.
 
 Walkthrough problems are invisible without this: the collision world is derived, not rendered, so
 you cannot tell whether you were stopped by the railing you can see, by a barrier a metre away from
-it, or by nothing at all. Press `C` (left controller trigger in VR, or open the page with
+it, or by nothing at all. Press `C` (left controller grip in VR, or open the page with
 `?colliders`) to draw every collider as a translucent box:
 
 | Colour | What it is |
