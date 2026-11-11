@@ -32,8 +32,10 @@ import socket
 import subprocess
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from tools.base import Tool
 
@@ -87,6 +89,122 @@ def www_dir() -> Path:
         if (cand / "index.html").is_file():
             return cand
     return data_dir() / "www"
+
+
+# ---------------------------------------------------------------------------
+# The shared model library
+# ---------------------------------------------------------------------------
+# Both plugins publish here, so one homepage lists every model either of them exported. A model's
+# identity is its file name: exporting the same document again replaces its folder, which is what
+# keeps the list free of duplicates.
+
+def library_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME")
+    env = os.environ.get("VRHUB_LIBRARY")
+    if env:
+        return Path(env)
+    root = Path(base) / "VRHub" if base else Path.home() / ".cache" / "vrhub"
+    return root / "library"
+
+
+def slugify(name) -> str:
+    """The URL- and folder-safe form of a document name: 'Casa Árboles' → 'casa-arboles'.
+
+    Must match ``ModelLibrary.Slugify`` in RevitVR: the same project exported from either plugin
+    is meant to land on the same card, not two that differ by an accent.
+    """
+    text = unicodedata.normalize("NFKD", str(name or "").strip())
+    out = []
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        if ch.isascii() and ch.isalnum():
+            out.append(ch.lower())
+        elif out and out[-1] != "-":
+            out.append("-")
+    slug = "".join(out).strip("-")
+    if len(slug) > 60:
+        slug = slug[:60].rstrip("-")
+    return slug or "model"
+
+
+SCENE_FILES = ("scene.glb", "colliders.json", "railings.json", "textures.json")
+
+
+def publish_library(out_dir, *, name, file_name=None, file_path=None, view=None,
+                    triangles=0, source="ingetrazo", source_label="IngeTrazo") -> str:
+    """Copy an export into the library, one folder per source file name.
+
+    Metadata is written last, so an interrupted publish is a folder the homepage ignores rather
+    than one it lists with no scene.
+    """
+    name = _strip_brand(name)
+    slug = slugify(name)
+    file_name = _strip_brand(file_name) if file_name else (Path(file_path).name if file_path else name)
+    entry = library_dir() / slug
+    scene = entry / "scene"
+    scene.mkdir(parents=True, exist_ok=True)
+
+    for fname in SCENE_FILES:
+        src, dst = Path(out_dir) / fname, scene / fname
+        if src.is_file():
+            tmp = dst.with_suffix(dst.suffix + ".tmp")
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)          # a viewer may be reading the old one
+        elif dst.is_file():
+            dst.unlink()                  # a sidecar the previous export wrote and this one did not
+
+    meta = {
+        "slug": slug,
+        "name": name,
+        "source": source,
+        "sourceLabel": source_label,
+        "fileName": file_name or name,
+        "filePath": file_path,
+        "view": view,
+        "exportedUtc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "triangles": triangles,
+        "generator": "IngeTrazo VR",
+    }
+    tmp = entry / "meta.json.tmp"
+    tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, entry / "meta.json")
+    return slug
+
+
+def list_models() -> list:
+    """What the homepage shows. Reads the folder each time, so an export appears immediately."""
+    root = library_dir()
+    models = []
+    if not root.is_dir():
+        return models
+    for entry in root.iterdir():
+        try:
+            if not entry.is_dir():
+                continue
+            meta_path = entry / "meta.json"
+            glb, col = entry / "scene" / "scene.glb", entry / "scene" / "colliders.json"
+            if not (meta_path.is_file() and glb.is_file() and col.is_file()):
+                continue
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue                   # half-written publish: not a model yet
+        models.append({
+            "slug": entry.name,
+            "name": meta.get("name") or entry.name,
+            "source": meta.get("source") or "other",
+            "sourceLabel": meta.get("sourceLabel"),
+            "fileName": meta.get("fileName"),
+            "filePath": meta.get("filePath"),
+            "view": meta.get("view"),
+            "exportedUtc": meta.get("exportedUtc") or datetime.fromtimestamp(
+                col.stat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
+            "triangles": meta.get("triangles"),
+            "glbBytes": glb.stat().st_size,
+            "colliderBytes": col.stat().st_size,
+        })
+    models.sort(key=lambda m: m.get("exportedUtc") or "", reverse=True)
+    return models
 
 
 # ---------------------------------------------------------------------------
@@ -809,17 +927,46 @@ def collect_faces(scene, options=None):
     return faces, openings, notes, stats
 
 
+def _strip_brand(text) -> str:
+    """Drop IngeTrazo's own name from a document title.
+
+    ``document.name`` reports the window title, "IngeTrazo — Burj Kalifa", while the library card
+    already shows the app as a pill. Keeping the prefix makes every IngeTrazo card start with the
+    same words and pushes the actual model name off the useful end of the line.
+    """
+    text = str(text or "").strip()
+    for sep in (" — ", " – ", " - ", " | ", ": "):
+        if sep in text:
+            head, tail = text.split(sep, 1)
+            if tail.strip() and head.strip().lower().startswith("ingetrazo"):
+                return tail.strip()
+    return text
+
+
 def document_name(viewport):
-    for getter in (lambda: viewport.document.name,
-                   lambda: Path(viewport.scene.path).stem,
+    for getter in (lambda: Path(viewport.scene.path).stem,
+                   lambda: viewport.document.name,
                    lambda: viewport.window().windowTitle()):
         try:
             v = getter()
             if v:
-                return Path(str(v)).stem
+                return _strip_brand(Path(str(v)).stem)
         except Exception:
             continue
     return "IngeTrazo model"
+
+
+def document_path(viewport):
+    """The open file's full path, when the API exposes it — the card shows its name."""
+    for getter in (lambda: viewport.scene.path,
+                   lambda: getattr(viewport.document, "path", None)):
+        try:
+            v = getter()
+            if v:
+                return str(v)
+        except Exception:
+            continue
+    return None
 
 
 def _sniff_image(data):
@@ -892,8 +1039,12 @@ def fix_glb_image_mimes(path):
     return changed
 
 
-def export(scene, *, name=None, write_glb=True, options=None):
-    """Write scene.glb + colliders.json into the export directory. GUI thread."""
+def export(scene, *, name=None, write_glb=True, options=None, file_path=None, view=None):
+    """Write scene.glb + colliders.json into the export directory, then publish to the library.
+
+    GUI thread. The export directory is the "last export" the legacy viewer paths read; the library
+    copy is what the homepage lists, keyed by the source file name so a re-export replaces it.
+    """
     out = export_dir()
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -934,6 +1085,25 @@ def export(scene, *, name=None, write_glb=True, options=None):
                            if glb_path.is_file() else 0.0)
     manifest["_seconds"] = round(time.time() - t0, 1)
     manifest["_faces"] = len(faces)
+
+    # Publish into the shared library the homepage lists. Keyed by the file name, so exporting the
+    # same model again replaces its card. A failure here must not fail the export: the scene on disk
+    # is complete and walkable either way.
+    manifest["_slug"] = None
+    if write_glb:
+        try:
+            manifest["_slug"] = publish_library(
+                out,
+                name=name or "Untitled",
+                file_name=Path(file_path).name if file_path else (name or "Untitled"),
+                file_path=file_path,
+                view=view,
+                triangles=int(manifest.get("triangleCount") or 0),
+            )
+        except Exception as exc:
+            notes.append(f"could not add this export to the model library ({exc})")
+            manifest["_notes"] = notes + manifest["warnings"]
+
     return manifest
 
 
@@ -948,13 +1118,74 @@ _https_server = None
 _https_port = None
 
 
-def _make_handler(root_www: Path, root_scene: Path):
+def _make_handler(root_www: Path, root_scene: Path, library: Path | None = None):
+    """Static viewer + the model library.
+
+    Routes: ``/`` is the homepage, ``/viewer.html?model=<slug>`` is the viewer on one model,
+    ``/models/<slug>/scene/<file>`` is that model's files, ``/api/models`` is the card list. The
+    legacy ``/scene/`` mapping still serves the last export, which is what ``?scene=`` opens.
+    """
+    import mimetypes
     from http.server import SimpleHTTPRequestHandler
+
+    lib = Path(library) if library else library_dir()
 
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=str(root_www), **kw)
 
+        # ---- library -------------------------------------------------------
+        def _json(self, payload):
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _model_file(self, clean: str) -> bool:
+            parts = [p for p in clean.split("/") if p]
+            # /models/<slug>/scene/<file> — nothing else is a model file
+            if len(parts) != 4 or parts[0] != "models" or parts[2] != "scene":
+                return False
+            slug, fname = parts[1], parts[3]
+            if (slug in (".", "..") or fname in (".", "..")
+                    or "/" in slug or "\\" in slug or "/" in fname or "\\" in fname
+                    or ".." in slug or ".." in fname):
+                self.send_error(404)
+                return True
+            path = (lib / slug / "scene" / fname).resolve()
+            try:
+                path.relative_to(lib.resolve())
+            except ValueError:
+                self.send_error(404)
+                return True
+            if not path.is_file():
+                self.send_error(404)
+                return True
+
+            data = path.read_bytes()
+            ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store, must-revalidate")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return True
+
+        def do_GET(self):
+            clean = self.path.split("?", 1)[0].split("#", 1)[0]
+            if clean == "/api/models":
+                return self._json({"models": list_models(), "library": str(lib)})
+            if clean.startswith("/api/"):
+                return self.send_error(404)
+            if clean.startswith("/models/") and self._model_file(clean):
+                return
+            super().do_GET()
+
+        # ---- static --------------------------------------------------------
         def translate_path(self, path):
             clean = path.split("?", 1)[0].split("#", 1)[0]
             if clean.startswith("/scene/"):
@@ -966,7 +1197,9 @@ def _make_handler(root_www: Path, root_scene: Path):
             try:
                 target.relative_to(base.resolve())
             except ValueError:
-                return str(root_www / "index.html")
+                # Escape attempt. A path that does not exist gives the browser a 404; handing back
+                # index.html instead would answer a traversal with 200 and hide the mistake.
+                return str(base / ".outside-the-web-root")
             if target.is_dir():
                 target = target / "index.html"
             return str(target)
@@ -1019,7 +1252,7 @@ def start_server(port=None):
             continue
         try:
             srv = Server(("0.0.0.0", cand),
-                         partial(_make_handler(www, export_dir())))
+                         partial(_make_handler(www, export_dir(), library_dir())))
             break
         except OSError as exc:
             last = exc
@@ -1125,7 +1358,7 @@ def start_https(port=None, force_cert=False):
             continue
         try:
             srv = Server(("0.0.0.0", cand),
-                         partial(_make_handler(www, export_dir())))
+                         partial(_make_handler(www, export_dir(), library_dir())))
         except OSError:
             continue
         try:
@@ -1188,16 +1421,16 @@ def _run(cmd, timeout=20):
         return -1, str(exc)
 
 
-def headset_url(port, https_port=None):
+def headset_url(port, https_port=None, path="/"):
     """The URL to type on the headset: https when we have a certificate."""
     if https_port:
-        return f"https://{lan_address()}:{https_port}/"
-    return f"http://{lan_address()}:{port}/"
+        return f"https://{lan_address()}:{https_port}{path}"
+    return f"http://{lan_address()}:{port}{path}"
 
 
-def open_on_headset(port, https_port=None):
+def open_on_headset(port, https_port=None, path="/"):
     """adb reverse + open the page. Returns (ok, message)."""
-    url = headset_url(port, https_port)
+    url = headset_url(port, https_port, path)
     adb = find_adb()
     if not adb:
         return False, ("adb not found — open " + url + " in the headset browser "
@@ -1216,10 +1449,10 @@ def open_on_headset(port, https_port=None):
     if rc != 0 or "error" in out.lower():
         return False, f"adb reverse failed: {out.strip()}"
     rc, out = _run([adb, "-s", serial, "shell", "am", "start", "-a",
-                    "android.intent.action.VIEW", "-d", f"http://localhost:{port}/"])
+                    "android.intent.action.VIEW", "-d", f"http://localhost:{port}{path}"])
     if rc != 0:
         return False, f"could not open the browser on the headset: {out.strip()}"
-    return True, f"open on {serial}: http://localhost:{port}/"
+    return True, f"open on {serial}: http://localhost:{port}{path}"
 
 
 # ---------------------------------------------------------------------------
@@ -1310,6 +1543,7 @@ def _make_dialog(viewport):
             self.repaint()
             try:
                 m = export(viewport.scene, name=document_name(viewport),
+                           file_path=document_path(viewport),
                            options={"walls": self.untagged.isChecked(),
                                     "opening_layers": self.opening_layers.text()})
             except Exception as exc:
@@ -1317,12 +1551,17 @@ def _make_dialog(viewport):
                 QMessageBox.warning(self, "IngeTrazo VR", f"Export failed:\n{exc}")
                 self.setEnabled(True)
                 return
+            slug = m.get("_slug")
+            model_path = f"/viewer.html?model={quote(slug)}" if slug else "/viewer.html"
             text = "\n".join(_report_lines(m))
             try:
                 port, reused = start_server(self.port_spin.value())
                 self.port = port
                 text += (f"\nthis PC:   http://localhost:{port}/"
                          + ("  (already running)" if reused else ""))
+                if slug:
+                    text += f"\nmodel:     http://localhost:{port}{model_path}"
+                text += f"\nlibrary:   {len(list_models())} model(s) listed at /"
                 https = start_https(port + 1)
                 self.https = https
                 if https:
@@ -1335,10 +1574,10 @@ def _make_dialog(viewport):
             except Exception as exc:
                 text += f"\nserver:  FAILED — {exc}"
             if where == "desktop" and self.port:
-                QDesktopServices.openUrl(QUrl(f"http://localhost:{self.port}/"))
+                QDesktopServices.openUrl(QUrl(f"http://localhost:{self.port}{model_path}"))
                 text += "\ndesktop preview opened in your browser"
             if where == "quest" and self.port:
-                ok, msg = open_on_headset(self.port, self.https)
+                ok, msg = open_on_headset(self.port, self.https, model_path)
                 text += "\nheadset:   " + msg + ("" if ok else "  (the export is still served)")
             self.log.setPlainText(text)
             self.setEnabled(True)
@@ -1374,7 +1613,10 @@ def setup(app):
     restart: the page is useless if the port only exists after an export."""
     def _boot():
         try:
-            if (export_dir() / "scene.glb").is_file():
+            # Serve at startup whenever there is anything to show: the last export, or a library
+            # full of models from either plugin. The homepage must work after a restart, not only
+            # right after an export.
+            if (export_dir() / "scene.glb").is_file() or list_models():
                 start_server()
                 start_https()
         except Exception:

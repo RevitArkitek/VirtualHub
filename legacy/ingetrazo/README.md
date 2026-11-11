@@ -40,12 +40,17 @@ That copies `ingetrazo_vr.py` to `%APPDATA%\ingetrazo\plugins\` and the viewer t
   fly, `R` respawn, `C` colliders.
 - **Re-export only** — writes the scene again, leaves the page alone.
 
-The dialog prints two addresses:
+The dialog prints the addresses it is serving:
 
 ```
-this PC:   http://localhost:8770/
-headset:   https://192.168.86.100:8771/     ← accept the certificate warning once
+library:   http://localhost:8770/                       ← every exported model, newest first
+model:     http://localhost:8770/viewer.html?model=…    ← the one just exported
+headset:   https://192.168.86.100:8771/                 ← accept the certificate warning once
 ```
+
+The export opens the model it just made; **‹ Library** in the viewer goes back to the list. Models
+exported from RevitVR appear in the same list, because both plugins publish into one folder
+(below).
 
 **Why the headset needs the https one.** WebXR only exists in a *secure context*. `localhost`
 counts as secure, so `adb reverse` (which makes the PC's server appear on the headset's own
@@ -72,7 +77,31 @@ The export runs on the GUI thread and reads only; it never adds an undo step or 
 document dirty. Running the server is a background thread that touches the export directory,
 never the document.
 
-Where things go: `%LOCALAPPDATA%\IngeTrazo\VR\export\scene.glb` and `colliders.json`.
+Where things go: `%LOCALAPPDATA%\IngeTrazo\VR\export\scene.glb` and `colliders.json` — the last
+export, which is what `?scene=` opens. Every export is also published into the shared library at
+`%LOCALAPPDATA%\VRHub\library\<model>\scene\`, beside a `meta.json` naming the source, the file,
+and when it was exported.
+
+## The model library
+
+One homepage lists every model either plugin has exported:
+
+```
+%LOCALAPPDATA%\VRHub\library\
+  farnsworth-house\        one folder per model file
+    meta.json
+    scene\                 scene.glb, colliders.json (+ railings.json / textures.json from Revit)
+  196-sw-2025\
+```
+
+The folder is a slug of the document's file name, so exporting `Farnsworth House` again replaces
+its contents and its card — the list never grows duplicates. The card shows the source (Revit or
+IngeTrazo), the file, the export time, size and triangle count, and clicking it opens that model at
+`/viewer.html?model=<slug>`.
+
+RevitVR's server serves the same homepage and the same folder, so either plugin's address shows the
+same list; a model exported from Revit is walkable from IngeTrazo's URL and the other way round.
+Both plugins must be built from the same `vr-web` (the web app is mirrored between the two repos).
 
 Press `C` (left grip in VR, or open the page with `?colliders`) to see what the
 collision engine believes:
@@ -201,8 +230,10 @@ kerb), it stands 2 m in front of the model instead and says so in the report.
 
 ```
 ingetrazo_vr.py            the plugin (single file; stdlib only at import time)
-ingetrazo_vr_www/          RevitVR's vr-web, served as-is
+ingetrazo_vr_www/          the shared web app: model library homepage + WebXR viewer
+                           (a mirror of RevitVR's vr-web/ — keep the two identical)
 tools/test_derive.py       derivation rules, no IngeTrazo needed
+tools/test_library.py      the shared library: slugs, replace-on-export, server routes
 tools/collide_probe.mjs    a manifest against the real collision engine
 tools/serve_test.py        serve any scene directory for a browser check
 tools/serve_https.py       the same plus TLS on a second port (headset check)

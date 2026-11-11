@@ -36,7 +36,13 @@ const GROUND = {
 function groundFromPolygons(surfaces) {
   const positions = [];
   for (const s of surfaces || []) {
-    const flat = Array.isArray(s.p) && s.p.length >= 6 ? s.p : null;
+    // Two exporters, one viewer: IngeTrazo emits the outline as `p` ([x,z,…]), RevitVR emits an
+    // axis-aligned rect (minX/minZ/maxX/maxZ). Both are floor polygons; a rect is just its corners.
+    const flat = Array.isArray(s.p) && s.p.length >= 6
+      ? s.p
+      : (s.minX != null && Number.isFinite(s.minX)
+          ? [s.minX, s.minZ, s.maxX, s.minZ, s.maxX, s.maxZ, s.minX, s.maxZ]
+          : null);
     if (!flat) continue;
     const contour = [];
     for (let i = 0; i < flat.length; i += 2) {

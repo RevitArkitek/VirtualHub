@@ -69,6 +69,17 @@ function collapseMeshes(root, chunk = 30) {
 }
 
 const UP = new THREE.Vector3(0, 1, 0);
+
+// ---------------------------------------------------------------- scene source
+// The library serves every model at /models/<slug>/scene/. Without ?model= the viewer falls back
+// to the folder it was opened from, which keeps the single-scene server (--scene, ?scene=) working
+// for tests and the desktop preview.
+const PARAMS = new URLSearchParams(location.search);
+const MODEL_SLUG = PARAMS.get('model');
+const SCENE_BASE = MODEL_SLUG
+  ? '/models/' + encodeURIComponent(MODEL_SLUG) + '/scene/'
+  : (PARAMS.get('scene') || './scene/');
+
 const RADIUS = 0.20;       // player capsule radius, metres. 0.30 was too fat once railing colliders landed on the stairs: on a 0.9 m flight it left a 0.2 m corridor, so you could not climb. 0.20 leaves ~0.65 m on the same stair.
 const HEAD = 1.72;         // capsule height above the floor
 const WALK = 1.65;         // m/s
@@ -115,6 +126,22 @@ renderer.xr.enabled = true;
   }
 }
 renderer.xr.setReferenceSpaceType('local-floor');
+
+// ---------------------------------------------------------------- back to the library
+// A link click during an immersive session does nothing: the session owns the screen. End it
+// first, then navigate — otherwise the button looks broken in exactly the device it is for.
+{
+  const back = document.getElementById('library');
+  if (back) {
+    back.addEventListener('click', async (e) => {
+      const session = renderer.xr.getSession();
+      if (!session) return;                 // desktop: let the link navigate
+      e.preventDefault();
+      try { await session.end(); } catch { /* already ending */ }
+      location.href = '/';
+    });
+  }
+}
 
 // ---------------------------------------------------------------- lighting
 app.scene.background = new THREE.Color(0x151b22);
@@ -487,11 +514,19 @@ function updateHud() {
 
 // ---------------------------------------------------------------- load
 async function load() {
-  const manifest = await fetch('./scene/colliders.json', { cache: 'no-store' }).then((r) => {
+  const manifest = await fetch(SCENE_BASE + 'colliders.json', { cache: 'no-store' }).then((r) => {
     if (!r.ok) throw new Error('colliders.json: HTTP ' + r.status);
     return r.json();
   });
   app.manifest = manifest;
+
+  // The manifest carries the document name, so a model opened from the library arrives titled
+  // instead of as "Model viewer".
+  if (manifest.name) {
+    document.title = manifest.name;
+    const t = document.getElementById('title');
+    if (t) t.textContent = manifest.name;
+  }
   app.world = new CollisionWorld(manifest.segments, manifest.surfaces, manifest.terrain);
 
   // the collision world, drawable on demand; ?colliders turns it on at load, which is what makes
@@ -514,9 +549,9 @@ async function load() {
     app.scene.environmentIntensity *= 0.6;
   }
 
-  const gltf = await new GLTFLoader().loadAsync('./scene/scene.glb');
+  const gltf = await new GLTFLoader().loadAsync(SCENE_BASE + 'scene.glb');
   // ?collapse=0 keeps the exporter's node graph, for measuring what merging buys
-  const doCollapse = new URLSearchParams(location.search).get('collapse') !== '0';
+  const doCollapse = PARAMS.get('collapse') !== '0';
   const model = doCollapse ? collapseMeshes(gltf.scene, 30) : gltf.scene;
   if (doCollapse) {
     gltf.scene.traverse((o) => {

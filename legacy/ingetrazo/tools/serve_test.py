@@ -44,7 +44,9 @@ spec.loader.exec_module(vr)
 
 print("www   :", vr.www_dir())
 print("export:", vr.export_dir())
+slug = vr.publish_library(export, name=scene.name)
 p, reused = vr.start_server(port)
-print(f"serving http://localhost:{p}/  (reused={reused})", flush=True)
+print(f"library http://localhost:{p}/  ({len(vr.list_models())} model(s), reused={reused})")
+print(f"viewer  http://localhost:{p}/viewer.html?model={slug}", flush=True)
 import threading
 threading.Event().wait()
