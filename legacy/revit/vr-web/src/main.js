@@ -2,15 +2,91 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { CollisionWorld } from './collision.js';
 import { buildColliderView } from './colliderview.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+/**
+ * Collapse a glTF's node graph into a few merged meshes.
+ *
+ * IngeTrazo writes a node per group and per instance, so one real site arrived
+ * as 18,587 meshes holding 874k triangles. Every mesh is a draw call, per eye,
+ * per frame — that is what makes a headset crawl while a desktop shrugs it off.
+ * Merging by material and by plan cell brings the draw count down to the tens
+ * and still leaves frustum culling something to do.
+ */
+function collapseMeshes(root, chunk = 30) {
+  root.updateMatrixWorld(true);
+  const buckets = new Map();
+  root.traverse((o) => {
+    if (!o.isMesh || Array.isArray(o.material)) return;
+    if (!o.geometry || !o.geometry.attributes.position) return;
+    const p = new THREE.Vector3().setFromMatrixPosition(o.matrixWorld);
+    const attrs = Object.keys(o.geometry.attributes).sort().join(',');
+    const key = [o.material.uuid,
+                 Math.floor(p.x / chunk), Math.floor(p.z / chunk),
+                 o.geometry.index ? 'i' : 'n', attrs].join('|');
+    let list = buckets.get(key);
+    if (!list) buckets.set(key, (list = []));
+    list.push(o);
+  });
+
+  const out = new THREE.Group();
+  out.name = 'model';
+  for (const list of buckets.values()) {
+    const geos = list.map((o) => {
+      const g = o.geometry.clone();
+      g.applyMatrix4(o.matrixWorld);
+      return g;
+    });
+    let merged = null;
+    if (geos.length > 1) {
+      try {
+        merged = mergeGeometries(geos, false);
+      } catch (e) {
+        merged = null;
+      }
+    } else {
+      merged = geos[0];
+    }
+    if (!merged) {                        // incompatible after all: keep them apart
+      for (const g of geos) {
+        if (g !== merged) g.dispose();
+      }
+      for (const o of list) {
+        const m = new THREE.Mesh(o.geometry.clone(), o.material);
+        m.applyMatrix4(o.matrixWorld);
+        out.add(m);
+      }
+      continue;
+    }
+    geos.forEach((g) => {
+      if (g !== merged) g.dispose();
+    });
+    merged.computeBoundingSphere();
+    merged.computeBoundingBox();
+    out.add(new THREE.Mesh(merged, list[0].material));
+  }
+  return out;
+}
 
 const UP = new THREE.Vector3(0, 1, 0);
+
+// ---------------------------------------------------------------- scene source
+// The library serves every model at /models/<slug>/scene/. Without ?model= the viewer falls back
+// to the folder it was opened from, which keeps the single-scene server (--scene, ?scene=) working
+// for tests and the desktop preview.
+const PARAMS = new URLSearchParams(location.search);
+const MODEL_SLUG = PARAMS.get('model');
+const SCENE_BASE = MODEL_SLUG
+  ? '/models/' + encodeURIComponent(MODEL_SLUG) + '/scene/'
+  : (PARAMS.get('scene') || './scene/');
+
 const RADIUS = 0.20;       // player capsule radius, metres. 0.30 was too fat once railing colliders landed on the stairs: on a 0.9 m flight it left a 0.2 m corridor, so you could not climb. 0.20 leaves ~0.65 m on the same stair.
 const HEAD = 1.72;         // capsule height above the floor
 const WALK = 1.65;         // m/s
 const RUN = 3.4;
 const SNAP = Math.PI / 6;  // 30 degrees
 const DEAD = 0.18;
-const BOOST = 3.0;         // left trigger held: movement speed multiplier (walk, fly, climb)
+const BOOST = 3.0;         // either trigger held: movement speed multiplier (walk, fly, climb)
 
 const app = {
   ready: false,
@@ -41,7 +117,31 @@ renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 // The scene is static, so the shadow map is rendered once and then frozen.
 renderer.shadowMap.autoUpdate = false;
 renderer.xr.enabled = true;
+// ?scale=0.8 renders the headset at 80% linear resolution: the cheapest frame
+// rate you can buy, paid for in softness. Default is the browser's own choice.
+{
+  const wanted = parseFloat(new URLSearchParams(location.search).get('scale') || '');
+  if (Number.isFinite(wanted) && wanted >= 0.4 && wanted <= 1.5) {
+    renderer.xr.setFramebufferScaleFactor(wanted);
+  }
+}
 renderer.xr.setReferenceSpaceType('local-floor');
+
+// ---------------------------------------------------------------- back to the library
+// A link click during an immersive session does nothing: the session owns the screen. End it
+// first, then navigate — otherwise the button looks broken in exactly the device it is for.
+{
+  const back = document.getElementById('library');
+  if (back) {
+    back.addEventListener('click', async (e) => {
+      const session = renderer.xr.getSession();
+      if (!session) return;                 // desktop: let the link navigate
+      e.preventDefault();
+      try { await session.end(); } catch { /* already ending */ }
+      location.href = '/';
+    });
+  }
+}
 
 // ---------------------------------------------------------------- lighting
 app.scene.background = new THREE.Color(0x151b22);
@@ -144,14 +244,13 @@ for (let i = 0; i < 2; i++) {
   );
   c.add(line);
   c.addEventListener('connected', (e) => { c.userData.handedness = e.data.handedness; });
-  c.addEventListener('selectstart', () => {
-    if (c.userData.handedness === 'right') toggleFly();
-  });
 
-  // left grip, not the trigger: the left trigger is held for boost, so a press-to-toggle there
-  // fought with locomotion. The grip is the one input nothing else uses during a walkthrough.
+  // Grips: right toggles walk/fly, left toggles the collider world. The trigger used to
+  // toggle fly, but both triggers are the boost button now, so a press-to-toggle there would
+  // fight with locomotion — the grip is the one input nothing else holds.
   c.addEventListener('squeezestart', () => {
-    if (c.userData.handedness === 'left') toggleColliders();
+    if (c.userData.handedness === 'right') toggleFly();
+    else if (c.userData.handedness === 'left') toggleColliders();
   });
   app.rig.add(c);
   controllers.push(c);
@@ -258,7 +357,7 @@ function flash(t) {
  * Applies one movement step. Kept separate from the render loop so the headless
  * test harness can drive it deterministically.
  *
- * `boost` is the fast-navigation multiplier (left trigger held) and scales every axis that
+ * `boost` is the fast-navigation multiplier (either trigger held) and scales every axis that
  * moves the rig — travel and climb alike — but never the snap turn, which stays one 30°
  * step so fast navigation cannot spin someone by accident.
  */
@@ -341,11 +440,14 @@ function readThumbsticks(sources = renderer.xr.getSession()?.inputSources ?? [])
   let wish = { x: 0, y: 0 };
   let turn = 0;
   let rightY = 0;   // right stick Y, forward positive. Fly mode: the climb axis.
-  let boost = false;   // left trigger held: fast navigation
+  let boost = false;   // either trigger held: fast navigation
   for (const src of sources) {
     const gp = src.gamepad;
     if (!gp || !gp.axes || gp.axes.length < 4) continue;
     const ax = gp.axes[2], ay = gp.axes[3];
+    // Either index trigger is the fast-navigation boost: xr-standard button 0 on both hands,
+    // so the left one keeps working and the right one joins it.
+    if (gp.buttons && gp.buttons[0] && gp.buttons[0].pressed) boost = true;
     if (src.handedness === 'right') {
       // Climb and snap turn are independent: the stick can do both at once, so the turn latch
       // gates the turn only and never the Y axis.
@@ -361,9 +463,7 @@ function readThumbsticks(sources = renderer.xr.getSession()?.inputSources ?? [])
         app.yawLatch = Math.sign(ax);
       }
     } else {
-      // Left hand — and any source the runtime does not label — travels the rig, and its
-      // index trigger (xr-standard button 0) is the fast-navigation boost.
-      if (gp.buttons && gp.buttons[0] && gp.buttons[0].pressed) boost = true;
+      // Left hand — and any source the runtime does not label — travels the rig.
       if (Math.abs(ax) >= DEAD || Math.abs(ay) >= DEAD) wish = { x: ax, y: -ay };
     }
   }
@@ -414,16 +514,28 @@ function updateHud() {
 
 // ---------------------------------------------------------------- load
 async function load() {
-  const manifest = await fetch('./scene/colliders.json', { cache: 'no-store' }).then((r) => {
+  const manifest = await fetch(SCENE_BASE + 'colliders.json', { cache: 'no-store' }).then((r) => {
     if (!r.ok) throw new Error('colliders.json: HTTP ' + r.status);
     return r.json();
   });
   app.manifest = manifest;
+
+  // The manifest carries the document name, so a model opened from the library arrives titled
+  // instead of as "Model viewer".
+  if (manifest.name) {
+    document.title = manifest.name;
+    const t = document.getElementById('title');
+    if (t) t.textContent = manifest.name;
+  }
   app.world = new CollisionWorld(manifest.segments, manifest.surfaces, manifest.terrain);
 
   // the collision world, drawable on demand; ?colliders turns it on at load, which is what makes
   // a screenshot of a suspect railing reproducible
-  app.colliderView = buildColliderView(manifest.segments);
+  app.colliderView = buildColliderView(manifest.segments, {
+    surfaces: manifest.surfaces,
+    terrain: manifest.terrain,
+    openings: manifest.openings_applied,
+  });
   app.colliderView.visible = false;
   app.scene.add(app.colliderView);
   if (new URLSearchParams(location.search).has('colliders')) toggleColliders(true);
@@ -437,9 +549,17 @@ async function load() {
     app.scene.environmentIntensity *= 0.6;
   }
 
-  const gltf = await new GLTFLoader().loadAsync('./scene/scene.glb');
+  const gltf = await new GLTFLoader().loadAsync(SCENE_BASE + 'scene.glb');
+  // ?collapse=0 keeps the exporter's node graph, for measuring what merging buys
+  const doCollapse = PARAMS.get('collapse') !== '0';
+  const model = doCollapse ? collapseMeshes(gltf.scene, 30) : gltf.scene;
+  if (doCollapse) {
+    gltf.scene.traverse((o) => {
+      if (o.isMesh && o.geometry) o.geometry.dispose(); // the merged copies live on
+    });
+  }
   let tris = 0;
-  gltf.scene.traverse((o) => {
+  model.traverse((o) => {
     if (o.isMesh) {
       o.frustumCulled = true;
       o.castShadow = true;
@@ -472,10 +592,10 @@ async function load() {
     }
   });
   app.stats.tris = Math.round(tris);
-  app.scene.add(gltf.scene);
+  app.scene.add(model);
 
   // fit the single shadow map to the model, then freeze it
-  const box = new THREE.Box3().setFromObject(gltf.scene);
+  const box = new THREE.Box3().setFromObject(model);
   if (!box.isEmpty()) {
     const c = box.getCenter(new THREE.Vector3());
     const size = Math.min(box.getSize(new THREE.Vector3()).length(), 80);
@@ -500,6 +620,7 @@ async function load() {
 function debugApi() {
   return {
     app,
+    renderer,
     get position() { return app.rig.position.clone(); },
     setPose(x, z, yawDeg = 0, y = null) {
       app.rig.position.set(x, y ?? app.rig.position.y, z);
@@ -529,13 +650,15 @@ function debugApi() {
     /**
      * Push the thumbsticks through the real readThumbsticks() → step() path with no headset.
      * `right` is the right stick's X axis, `left` is [x, y]; opts: `rightY` (right stick Y,
-     * forward positive), `trigger` (left index trigger held), `dt`. Call with right = 0 to
-     * release the snap-turn latch, as letting go of the stick does.
+     * forward positive), `trigger` (left index trigger held), `rightTrigger` (right index
+     * trigger held), `dt`. Call with right = 0 to release the snap-turn latch, as letting go
+     * of the stick does.
      */
-    simulateStick(right = 0, left = [0, 0], { dt = 1 / 72, rightY = 0, trigger = false } = {}) {
+    simulateStick(right = 0, left = [0, 0],
+                  { dt = 1 / 72, rightY = 0, trigger = false, rightTrigger = false } = {}) {
       const sources = [
         { handedness: 'left', gamepad: { axes: [0, 0, left[0], left[1]], buttons: [{ pressed: trigger }] } },
-        { handedness: 'right', gamepad: { axes: [0, 0, right, rightY], buttons: [{ pressed: false }] } },
+        { handedness: 'right', gamepad: { axes: [0, 0, right, rightY], buttons: [{ pressed: rightTrigger }] } },
       ];
       const { wish, turn, rightY: climb, boost } = readThumbsticks(sources);
       if (app.fly) step(dt, { x: wish.x, y: wish.y, fly: climb }, turn, boost);

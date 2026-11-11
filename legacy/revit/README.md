@@ -31,6 +31,7 @@ Built and verified on this machine (Revit 2025, .NET 8, Quest path via adb):
 | Collider geometry (fitting, railing paths, containment) | 48/48 (rectangles, circles, degenerate input, measured heights, dropped phantom pieces, resampling, point-in-solid) |
 | Collision engine | 29/29 headless assertions — walls, doorways, stairs, terrain, oriented obstacles, railings |
 | WebXR viewer | loads, renders, walks, climbs, collides in a real browser |
+| Model library (one homepage, both plugins' exports) | served by each plugin's server; verified in a browser against the real Revit and IngeTrazo exports, including re-publishing the same file |
 | Local server | serves viewer + scene, HTTP loopback and HTTPS LAN; certificate persisted |
 | Installer | `dist\` assembled, installed to Revit's addins folder, deployment re-checked |
 | **Export of an actual building** | **not yet run — needs a Revit session and your model** |
@@ -82,7 +83,11 @@ likely to need extending in `TexturePathResolver.DefaultRoots()`.
 
 ## Install
 
-Requires Windows, Revit 2025, a Quest 3, and `adb` (Android platform-tools).
+Requires Windows, Revit 2025 or 2026, a Quest 3, and `adb` (Android platform-tools). The add-in is
+compiled against the runtime Revit itself declares — `build.ps1` reads
+`RevitAPI.runtimeconfig.json`, so a 2025.5+/2026 install needs the .NET 10 SDK and an earlier 2025
+install needs .NET 8. It looks for a user-local SDK in `%USERPROFILE%\.dotnet` as well as the one on
+`PATH`.
 
 ```powershell
 .\build.ps1                 # builds everything, installs into Revit 2025
@@ -107,24 +112,93 @@ self-signed certificate warning once on the headset.
 
 | Button | What it does |
 |---|---|
-| **Enter VR** | Exports the active 3D view, then opens it on the headset. This is the one that changes the scene. |
-| **Open Viewer** | Re-opens the *last* export on the headset without exporting again. Nothing is re-read from the model. |
-| **Preview Desktop** | Opens the *last* export in this PC's browser — same viewer, same renderer, no headset. |
+| **Enter VR** | Exports the active 3D view, publishes it to the model library, then opens it on the headset. This is the one that changes the scene. |
+| **Model Library** | Opens the library homepage on the headset: every model either plugin has exported, newest first. Nothing is re-read from the model. |
+| **Preview Desktop** | Opens the same library in this PC's browser — same viewer, same renderer, no headset. |
 
 The export runs synchronously on Revit's UI thread, so on a large model Enter VR blocks Revit for
-as long as it takes. Open Viewer and Preview Desktop are the way back in without paying that
+as long as it takes. Model Library and Preview Desktop are the way back in without paying that
 again — the headset went to sleep, the browser tab closed, adb dropped, or you want to check the
-model before putting anything on your head. Both serve whatever is in
-`%LOCALAPPDATA%\RevitVR\export` whichever document is open, so their dialogs name the scene and
-when it was exported, and say so when that isn't the project you have open. With no export to
-serve they refuse and tell you to press Enter VR; if a launch fails they say which step failed
-rather than reporting success anyway.
+model before putting anything on your head. Model Library serves the whole library (which may
+include models exported from IngeTrazo); its dialog names the scene of the last export and when
+that was, so a stale model is visible before you walk into it. If a launch fails they say which
+step failed rather than reporting success anyway.
 
 Preview Desktop is plain `http://localhost:<port>` on loopback, so it needs no certificate and no
 adb. The page keeps working after you leave it alone: press Enter VR for a new export, then reload
-the tab. Desktop controls are listed on the page (and in [Controls](#controls)); `C` draws the
-colliders, which is the quickest way to see why a wall stopped you before you go hunting for it in
-the headset.
+the tab (or come back to the library, which re-reads it). Desktop controls are listed on the page
+(and in [Controls](#controls)); `C` draws the colliders, which is the quickest way to see why a
+wall stopped you before you go hunting for it in the headset.
+
+## The model library
+
+Both plugins export into one library, and both serve one homepage that lists it — so whichever
+button you pressed, you land on the same page.
+
+```
+%LOCALAPPDATA%\VRHub\library\
+  196-sw-2025\              one folder per model file
+    meta.json               name, source, 3D view, export time, triangle count
+    scene\                  scene.glb, colliders.json, railings.json, textures.json
+  farnsworth-house\
+```
+
+The folder comes from the document's file name, so `196 SW-2025.rvt` is always `196-sw-2025`.
+Exporting it again replaces the folder's contents and its card; there is never a second entry for
+the same file. Two 3D views of one project are therefore one card — the view named on it is the one
+exported last. Because each entry is a copy, an older model keeps walking after you move on.
+
+The homepage is served by whichever plugin's server is up: RevitVR's (usually
+`http://localhost:8765/`, plus `https://<lan-ip>:8766/` for the headset) or IngeTrazo's
+(`:8770`, plus `:8771` over https). Both read the same folder, so the list is identical either way.
+A model opens at `/viewer.html?model=<slug>`, and **‹ Library** in the viewer ends the XR session
+and returns to the list.
+
+Clicking a card is the same viewer the export opens, so nothing about the walk changes — same
+collision world, same collider overlay, same controls.
+
+Exports made before the library existed are still in their own folders. Import one:
+
+```powershell
+python tools\seed-library.py --source revit --name "196 SW-2025" --file "196 SW-2025.rvt" --view "Level 1"
+python tools\seed-library.py --source ingetrazo --name "Farnsworth House" `
+    --dir "$env:LOCALAPPDATA\IngeTrazo\VR\export"
+```
+
+That writes the same `meta.json` a real export does; it is only for models exported before the
+library existed.
+
+## Starting the library without Revit
+
+The server is a standalone exe — it needs neither Revit nor IngeTrazo running, and the page it
+serves is the same one the plugins use:
+
+```powershell
+.\tools\serve-library.ps1              # start on :8765 and open it in this PC's browser
+.\tools\serve-library.ps1 -Headset     # also open it on the Quest
+.\tools\serve-library.ps1 -NoBrowser   # just start it
+.\tools\serve-library.ps1 -Stop        # stop the library server
+```
+
+Double-clicking **Model Library** does the first one. The shortcut is on the desktop and in the
+Start menu (so typing "model library" finds it); if the desktop is OneDrive-synced it exists in
+both desktop folders.
+
+It starts the installed `RevitVr.Server.exe`, which now listens twice on every run:
+
+| | |
+|---|---|
+| `http://localhost:8765/` | this PC, and the headset over `adb reverse` (no certificate) |
+| `https://<lan-ip>:8766/` | the headset over Wi-Fi, where WebXR needs a secure origin |
+
+So the headset is reachable whether or not adb is connected, and both addresses show the same
+library. It is safe to run repeatedly: if a library server is already answering, the script opens
+that one instead of starting a second, and a stop/start keeps the same port so the headset's
+bookmark stays valid. Exporting later from Revit or IngeTrazo replaces the card; the homepage
+re-reads the library whenever you return to it, or press Refresh.
+
+Because it is the same exe the add-in launches, whichever way it was started, Enter VR reuses it
+rather than opening a second server.
 
 ## Controls
 
@@ -132,11 +206,12 @@ the headset.
 |---|---|
 | Left stick | walk |
 | Right stick left/right | snap turn 30° per push, in the direction you push — let the stick spring back before the next step |
-| Trigger / A | toggle fly mode |
+| Right grip | toggle walk / fly |
 | Left grip | show the collision world |
-| Left trigger (hold) | fast navigation: 3× movement speed while held — walking, flying and climbing; snap turn stays 30° |
+| Either trigger (hold) | fast navigation: 3× movement speed while held — walking, flying and climbing; snap turn stays 30° |
 | While flying | left stick ↑↓ forward/back, ←→ strafe — same as walking. Right stick ↑↓ climbs (push forward) / descends (pull back), ←→ still snap turns |
 | Desktop | WASD, drag to look, `F` fly, `Q`/`E` down/up, `R` respawn, `C` colliders |
+| Both | **‹ Library** in the top bar returns to the model list (it ends the XR session first) |
 
 ## Seeing the colliders
 
@@ -187,7 +262,7 @@ dotnet run --project tools/test-planrect
 # walls block, doorways pass, corners hold, storeys don't interfere, railings hold the edge
 node tools/test-collision.mjs runtime/export/colliders.json
 
-# the installed add-in resolves: class names, interfaces, and every asset path Revit will need
+# the installed add-in resolves: class names, interfaces, asset paths, and a real library publish
 dotnet run --project tools/addincheck
 
 # railing colliders are railing-sized and agree with what renders (one storey off, or four metres tall)
@@ -414,9 +489,11 @@ still occlusion only.
 ```
 src/RevitVr.Core/        GLB writer + scene schema (no Revit dependency, unit-testable)
 src/RevitVr.Addin/       Revit add-in: ribbon, IPhotoRenderContext export, collider harvest, adb
-src/RevitVr.Server/      Kestrel static server: viewer at /, scene at /scene/, /api/status
-vr-web/                  WebXR viewer: three.js, locomotion, collision
+src/RevitVr.Server/      Kestrel static server: library homepage, viewer, /models/, /api/models
+vr-web/                  the shared web app: model library homepage + WebXR viewer
 tools/demogen/           synthetic two-room scene in the export format, textures included
+tools/seed-library.py    import an export made before the library existed
+tools/serve-library.ps1  start the library server without Revit or IngeTrazo (desktop shortcut)
 tools/test-collision.mjs acceptance test for the collision rules
 tools/test-textures/     texture pipeline: encoder, path resolver, UVs, textured GLB
 tools/test-ao/           occlusion bake: BVH, falloff, subdivision, COLOR_0
@@ -445,3 +522,20 @@ or the origin is not a secure context. On the headset use the `localhost` addres
 reverse) or the HTTPS address.
 
 **Exported nothing.** The view was empty or fully cropped away.
+
+**The library says "Library unavailable".** The page is being served by a server built before the
+library existed (an old `RevitVr.Server.exe` left running, or IngeTrazo before it was restarted).
+Press Enter VR or Model Library once to start the current server, and restart IngeTrazo if its own
+server is the one on screen.
+
+**The headset cannot open the library.** It needs the https side: `https://<lan-ip>:8766/` for a
+server started on :8765 (IngeTrazo's is `:8771`). The http address is loopback-only by design —
+`http://192.168.x.x` is not a secure origin, so WebXR cannot start there either. If the https page
+will not load at all, the server is down: run `tools\serve-library.ps1` (or the **Model Library**
+shortcut) and it prints the address to use. Windows Firewall must allow the server exe — `build.ps1`
+adds that rule when run as Administrator.
+
+**The library is empty after an export.** Refresh the page. Cards come from
+`%LOCALAPPDATA%\VRHub\library`; if that folder has no subfolder for the model, the publish step
+failed and the export dialog says so — the scene itself is still in
+`%LOCALAPPDATA%\RevitVR\export`.

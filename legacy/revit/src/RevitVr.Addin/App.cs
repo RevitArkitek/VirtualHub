@@ -78,11 +78,15 @@ public sealed class App : IExternalApplication
         // A second button that just re-opens the viewer, without re-exporting.
         var reopen = new PushButtonData(
             "RevitVrReopen",
-            "Open\nViewer",
+            "Model\nLibrary",
             asmPath,
             typeof(OpenViewerCommand).FullName)
         {
-            ToolTip = "Re-open the last exported scene on the headset without re-exporting.",
+            ToolTip = "Open the model library on the headset — every exported model, from Revit or IngeTrazo.",
+            LongDescription =
+                "Lists every model either plugin has exported, newest first. Pick one and press\n" +
+                "Enter VR to walk it. Nothing is re-exported, so this is the way back in after the\n" +
+                "headset went to sleep or the browser tab closed.",
         };
         panel.AddItem(reopen);
 
@@ -136,16 +140,9 @@ public sealed class OpenViewerCommand : IExternalCommand
 {
     public Result Execute(ExternalCommandData data, ref string message, ElementSet elements)
     {
-        // This command does not export: it re-opens whatever the last Enter VR left in the export
-        // folder. Starting a server on an empty folder gives a page that dies on a 404 with no
-        // hint about what to do, so check for a scene first and say what to press.
-        if (!Export.SceneFiles.Ready)
-        {
-            TaskDialog.Show("RevitVR",
-                Export.SceneFiles.NothingExported + "\n\n" + Export.SceneFiles.Dir);
-            return Result.Cancelled;
-        }
-
+        // This command does not export: it opens the model library, which serves every model
+        // either plugin has published. With nothing published the homepage says so, which is a
+        // better answer than refusing to open a page at all.
         var adb = Launch.Adb.Find();
         var deviceOk = adb is not null && Launch.Adb.Devices().Any(d => d.State == "device");
         var port = Export.ExportJob.EnsureServer(lan: !deviceOk, out var err);
@@ -155,15 +152,16 @@ public sealed class OpenViewerCommand : IExternalCommand
             return Result.Failed;
         }
 
-        var title = data.Application.ActiveUIDocument?.Document?.Title;
-        var scene = Export.SceneFiles.Describe(title);
+        var models = Directory.EnumerateDirectories(Export.ModelLibrary.Root).Count();
+        var scene = Export.SceneFiles.Describe(data.Application.ActiveUIDocument?.Document?.Title);
 
         if (!deviceOk)
         {
             var ip = Export.ExportJob.LanAddress();
             TaskDialog.Show("RevitVR",
                 scene +
-                $"Open this on the headset:\n\nhttps://{ip}:{port}/\n\n" +
+                $"Open the model library on the headset:\n\nhttps://{ip}:{port + 1}/\n\n" +
+                $"It lists {models} model(s), from Revit and IngeTrazo.\n" +
                 "Accept the certificate warning once (Advanced → Proceed).\n" +
                 "No adb, so this is the Wi-Fi path: Windows Firewall must allow the server.");
             return Result.Succeeded;
@@ -174,8 +172,8 @@ public sealed class OpenViewerCommand : IExternalCommand
         {
             TaskDialog.Show("RevitVR",
                 scene +
-                $"Opening http://localhost:{port}/ on the headset.\n" +
-                "Put it on and press Enter VR.");
+                $"Opening the model library on the headset — {models} model(s).\n" +
+                "Pick a model, then press Enter VR.");
             return Result.Succeeded;
         }
 
@@ -212,13 +210,10 @@ public sealed class PreviewCommand : IExternalCommand
     /// </summary>
     public Result Execute(ExternalCommandData data, ref string message, ElementSet elements)
     {
-        if (!Export.SceneFiles.Ready)
-        {
-            TaskDialog.Show("RevitVR",
-                Export.SceneFiles.NothingExported + "\n\n" + Export.SceneFiles.Dir);
-            return Result.Cancelled;
-        }
-
+        // The same library in this PC's browser, so models can be browsed and walked without the
+        // headset. The viewer is the one the headset runs and the server is http on loopback, so
+        // this costs no second renderer — but it does mean the preview shows the *exported* scene,
+        // not the live Revit model: press Enter VR first if the model has changed.
         // lan:false — the browser is on this machine, so loopback over http needs no certificate
         // and none of the adb work the headset path needs.
         var port = Export.ExportJob.EnsureServer(lan: false, out var err);

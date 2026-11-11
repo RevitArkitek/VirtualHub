@@ -19,12 +19,6 @@ public static class SceneFiles
     /// </summary>
     public static bool Ready => File.Exists(ScenePath) && File.Exists(ColliderPath);
 
-    /// <summary>What to press when there is nothing to open yet.</summary>
-    public const string NothingExported =
-        "There is no exported scene to open yet.\n\n" +
-        "Open a 3D view and press Enter VR — that is what exports the model.\n" +
-        "This button only opens the scene the last export left behind:";
-
     public static string Describe(string? openDocument) => Describe(ColliderPath, openDocument);
 
     /// <summary>

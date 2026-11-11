@@ -115,7 +115,7 @@ if (pathsType != null)
     var export = pathsType.GetProperty("ExportDir")!.GetValue(null) as string;
 
     Check("viewer assets resolved", web != null, web ?? "null");
-    Check("viewer index.html reachable", web != null && File.Exists(Path.Combine(web, "index.html")));
+    Check("web app index.html reachable", web != null && File.Exists(Path.Combine(web, "index.html")));
     Check("server exe resolved", server != null, server ?? "null");
     Check("server exe on disk", server != null && File.Exists(server));
     Check("export dir creatable", export != null && Directory.Exists(export), export ?? "null");
@@ -150,6 +150,48 @@ if (sceneFiles != null)
     Check("Describe returns empty for an unreadable manifest", unreadable.Length == 0);
 
     File.Delete(temp);
+}
+
+// ---------------------------------------------------------------- C: library publish
+// ModelLibrary is Revit-free, so the last step Enter VR runs — publishing into the shared library
+// — can be executed here for real: the slug is the entry's identity, and a second publish has to
+// replace that entry rather than add a card.
+Console.WriteLine("\nlibrary publish (Revit-free):");
+var libType = asm.GetType("RevitVr.Addin.Export.ModelLibrary");
+Check("ModelLibrary type loads", libType != null);
+if (libType != null)
+{
+    var slugify = libType.GetMethod("Slugify")!;
+    string Slug(string s) => (string)slugify.Invoke(null, new object?[] { s })!;
+    Check("slug of '196 SW-2025'", Slug("196 SW-2025") == "196-sw-2025", Slug("196 SW-2025"));
+    Check("slug folds accents", Slug("Casa Árboles") == "casa-arboles", Slug("Casa Árboles"));
+    Check("slug falls back for an empty name", Slug("  ") == "model", Slug("  "));
+
+    var scratch = Path.Combine(Path.GetTempPath(), "vrhub-check-" + Guid.NewGuid().ToString("N"));
+    var export = Path.Combine(scratch, "export");
+    Directory.CreateDirectory(export);
+    File.WriteAllBytes(Path.Combine(export, "scene.glb"), new byte[] { 1, 2, 3 });
+    File.WriteAllText(Path.Combine(export, "colliders.json"), "{\"name\":\"Check Model\"}");
+    Environment.SetEnvironmentVariable("VRHUB_LIBRARY", Path.Combine(scratch, "library"));
+
+    var publish = libType.GetMethod("Publish")!;
+    var slug = (string)publish.Invoke(null,
+        new object?[] { export, "Check Model", @"C:\models\Check Model.rvt", "Level 1", 1234, 2025 })!;
+    var entry = Path.Combine(scratch, "library", slug);
+    Check("publish copies the scene", File.Exists(Path.Combine(entry, "scene", "scene.glb")));
+    Check("publish writes metadata", File.Exists(Path.Combine(entry, "meta.json")));
+    var meta = File.ReadAllText(Path.Combine(entry, "meta.json"));
+    Check("metadata names the source", meta.Contains("\"source\"") && meta.Contains("revit"));
+    Check("metadata carries the triangle count", meta.Contains("1234"));
+
+    publish.Invoke(null, new object?[] { export, "Check Model", null, "Level 2", 4321, 2025 });
+    var entries = Directory.GetDirectories(Path.Combine(scratch, "library"));
+    Check("re-publish replaces the entry", entries.Length == 1, entries.Length + " entr(ies)");
+    Check("re-publish refreshes the metadata",
+        File.ReadAllText(Path.Combine(entry, "meta.json")).Contains("4321"));
+
+    Environment.SetEnvironmentVariable("VRHUB_LIBRARY", null);
+    try { Directory.Delete(scratch, true); } catch { }
 }
 
 var dir = Path.GetDirectoryName(asmPath)!;

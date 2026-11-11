@@ -1,4 +1,4 @@
-// Serves the WebXR viewer and a freshly exported scene to the headset.
+// Serves the WebXR viewer, the model library, and a freshly exported scene to the headset.
 //
 // Two transports, both hit the same app:
 //   http://127.0.0.1:<port>/           loopback. With `adb reverse tcp:<port> tcp:<port>` the
@@ -6,37 +6,62 @@
 //                                      browsers treat as a secure context, so WebXR works
 //                                      with no certificate to accept.
 //   https://<lan-ip>:<port>/           --lan. Self-signed, accept the warning once on the Quest.
+//
+// Two modes:
+//   --library <dir>                    the model library: "/" lists every exported model and each
+//                                      one is served from /models/<slug>/scene/. Both plugins use
+//                                      this, so one homepage shows models from either source.
+//   (no --library)                     one scene at /scene, viewer at /viewer.html. Kept for the
+//                                      demogen and test path, which has no library to show.
 using System.Net;
-using System.Net.NetworkInformation;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text.Json;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.FileProviders;
 
 var opts = Options.Parse(args);
-if (!Directory.Exists(opts.SceneDir))
+if (!Directory.Exists(opts.AppDir))
 {
-    Console.Error.WriteLine($"scene directory not found: {opts.SceneDir}");
+    Console.Error.WriteLine($"web directory not found: {opts.AppDir}");
     return 2;
 }
+if (opts.Library is not null) Directory.CreateDirectory(opts.Library);
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.ClearProviders();
 
+// Two listeners, always:
+//   http  on 127.0.0.1:<port>   the adb-reverse path, and this PC's browser
+//   https on 0.0.0.0:<port+1>   the Wi-Fi path — WebXR needs a secure context, and a headset with
+//                              no adb cannot use loopback at all
+// --lan is still accepted (old shortcuts pass it) but there is nothing left for it to switch on.
+var httpsPort = opts.Port + 1;
 X509Certificate2? cert = null;
-if (opts.Lan)
+try
 {
     // Reused across runs so the headset keeps trusting it; regenerate with --new-cert.
     cert = SelfSigned.LoadOrCreate("RevitVR",
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RevitVR"),
         opts.NewCert);
 }
+catch (Exception ex)
+{
+    Console.WriteLine($"  certificate unavailable ({ex.Message}); serving http only");
+}
 
 builder.WebHost.ConfigureKestrel(k =>
 {
     k.AddServerHeader = false;
-    var ip = opts.Lan ? IPAddress.Any : IPAddress.Loopback;
-    k.Listen(ip, opts.Port, listen => { if (cert != null) listen.UseHttps(cert); });
+    k.Listen(IPAddress.Loopback, opts.Port);
+    if (cert is not null)
+    {
+        // A busy port+1 must not take the whole server down: downgrade to http-only and say so.
+        if (PortIsFree(httpsPort))
+            k.Listen(IPAddress.Any, httpsPort, listen => listen.UseHttps(cert));
+        else
+            Console.WriteLine($"  https port {httpsPort} is busy; serving http only");
+    }
 });
 
 var app = builder.Build();
@@ -73,9 +98,38 @@ var viewerFiles = new StaticFileOptions
     }
 };
 
-app.UseDefaultFiles(new DefaultFilesOptions { FileProvider = new PhysicalFileProvider(opts.AppDir) });
 app.UseStaticFiles(noStore);
 app.UseStaticFiles(viewerFiles);
+
+// "/" is the library when there is one. Without a library this is the single-scene server the
+// tests use, and the homepage has nothing to list — so go straight to the viewer.
+app.MapGet("/", (HttpContext ctx) =>
+{
+    if (opts.Library is null) return Results.Redirect("/viewer.html");
+    var index = Path.Combine(opts.AppDir, "index.html");
+    if (!File.Exists(index)) return Results.NotFound("index.html is missing from " + opts.AppDir);
+    ctx.Response.Headers.CacheControl = "no-cache";
+    return Results.File(index, "text/html; charset=utf-8");
+});
+
+app.MapGet("/api/models", () =>
+    Results.Json(opts.Library is null
+        ? new { models = Array.Empty<ModelRow>(), library = (string?)null }
+        : ModelIndex.Scan(opts.Library)));
+
+// One folder per model, one URL per folder. Only a file directly under <slug>/scene is served:
+// the library is a folder on the user's disk, so a traversal-shaped slug must go nowhere.
+app.MapGet("/models/{slug}/scene/{file}", (string slug, string file, HttpContext ctx) =>
+{
+    if (opts.Library is null) return Results.NotFound();
+    var path = ModelIndex.Resolve(opts.Library, slug, file);
+    if (path is null) return Results.NotFound();
+    ctx.Response.Headers.CacheControl = "no-store, must-revalidate";
+    var contentType = types.TryGetContentType(Path.GetExtension(path), out var ct)
+        ? ct
+        : "application/octet-stream";
+    return Results.File(path, contentType);
+});
 
 app.MapGet("/api/status", () =>
 {
@@ -84,40 +138,150 @@ app.MapGet("/api/status", () =>
     return Results.Json(new
     {
         ok = true,
+        app = "revitvr",
         scene = opts.SceneDir,
         hasScene = File.Exists(glb) && File.Exists(manifest),
         glbBytes = File.Exists(glb) ? new FileInfo(glb).Length : 0,
         exportedAt = File.Exists(manifest) ? File.GetLastWriteTimeUtc(manifest).ToString("o") : null,
+        library = opts.Library,
+        models = opts.Library is null ? 0 : ModelIndex.Count(opts.Library),
         port = opts.Port,
-        transport = cert != null ? "https" : "http",
+        httpsPort = cert is not null ? httpsPort : 0,
+        https = cert is not null,
+        transport = "http",
     });
 });
 
+static bool PortIsFree(int port)
+{
+    try
+    {
+        var probe = new System.Net.Sockets.TcpListener(IPAddress.Any, port);
+        probe.Start();
+        probe.Stop();
+        return true;
+    }
+    catch { return false; }
+}
+
 app.Lifetime.ApplicationStarted.Register(() =>
 {
-    var scheme = cert != null ? "https" : "http";
     Console.WriteLine($"RevitVR server up   scene: {opts.SceneDir}");
-    Console.WriteLine($"  loopback  {scheme}://127.0.0.1:{opts.Port}/");
-    if (opts.Lan)
+    if (opts.Library is not null)
+        Console.WriteLine($"  library   {opts.Library}  ({ModelIndex.Count(opts.Library)} models)");
+    Console.WriteLine($"  local     http://127.0.0.1:{opts.Port}/");
+    if (cert is not null)
     {
         foreach (var ip in Lan.Addresses())
-            Console.WriteLine($"  headset   {scheme}://{ip}:{opts.Port}/");
+            Console.WriteLine($"  headset   https://{ip}:{httpsPort}/   (accept the certificate once)");
     }
-    else
-    {
-        Console.WriteLine($"  headset   adb reverse tcp:{opts.Port} tcp:{opts.Port}  ->  http://localhost:{opts.Port}/");
-    }
+    Console.WriteLine($"  adb       adb reverse tcp:{opts.Port} tcp:{opts.Port} -> http://localhost:{opts.Port}/");
     Console.WriteLine("READY");
 });
 
 app.Run();
 return 0;
 
-internal sealed record Options(string AppDir, string SceneDir, int Port, bool Lan, bool NewCert)
+/// <summary>One exported model, as the homepage sees it.</summary>
+internal sealed record ModelRow(
+    string Slug, string Name, string Source, string? SourceLabel, string? FileName,
+    string? FilePath, string? View, string ExportedUtc, int? Triangles, long GlbBytes, long ColliderBytes);
+
+/// <summary>The model library: one folder per exported file, each holding <c>scene/</c>.</summary>
+internal static class ModelIndex
+{
+    /// <summary>
+    /// Builds the list the homepage renders. The folder is the only source of truth, so a model
+    /// folder copied in by hand shows up and one deleted disappears — nothing is cached here,
+    /// which is what makes a re-export replace its card instead of adding a second one.
+    /// </summary>
+    public static object Scan(string library)
+    {
+        var rows = new List<ModelRow>();
+        if (!Directory.Exists(library)) return new { models = rows, library };
+
+        foreach (var dir in Directory.EnumerateDirectories(library))
+        {
+            var metaPath = Path.Combine(dir, "meta.json");
+            var glb = Path.Combine(dir, "scene", "scene.glb");
+            var colliders = Path.Combine(dir, "scene", "colliders.json");
+            if (!File.Exists(metaPath) || !File.Exists(glb) || !File.Exists(colliders)) continue;
+
+            string? name, source, sourceLabel, fileName, filePath, view, exportedUtc;
+            int? triangles = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(metaPath));
+                var root = doc.RootElement;
+                name = Str(root, "name");
+                source = Str(root, "source");
+                sourceLabel = Str(root, "sourceLabel");
+                fileName = Str(root, "fileName");
+                filePath = Str(root, "filePath");
+                view = Str(root, "view");
+                exportedUtc = Str(root, "exportedUtc");
+                if (root.TryGetProperty("triangles", out var t) && t.TryGetInt32(out var ti)) triangles = ti;
+            }
+            catch
+            {
+                // A half-written meta.json is a model that was interrupted mid-publish. It is not
+                // listed; the next export rewrites it.
+                continue;
+            }
+
+            var slug = Path.GetFileName(dir);
+            rows.Add(new ModelRow(
+                slug,
+                name ?? slug,
+                source ?? "other",
+                sourceLabel,
+                fileName,
+                filePath,
+                view,
+                exportedUtc ?? File.GetLastWriteTimeUtc(colliders).ToString("o"),
+                triangles,
+                new FileInfo(glb).Length,
+                new FileInfo(colliders).Length));
+        }
+
+        rows.Sort((a, b) => string.CompareOrdinal(b.ExportedUtc, a.ExportedUtc));
+        return new { models = rows, library };
+    }
+
+    public static int Count(string library)
+    {
+        if (!Directory.Exists(library)) return 0;
+        return Directory.EnumerateDirectories(library)
+            .Count(d => File.Exists(Path.Combine(d, "meta.json")) &&
+                        File.Exists(Path.Combine(d, "scene", "scene.glb")));
+    }
+
+    private static string? Str(JsonElement root, string name)
+        => root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+    /// <summary>Maps /models/&lt;slug&gt;/scene/&lt;file&gt; to a real path, or null if it is outside the library.</summary>
+    public static string? Resolve(string library, string slug, string file)
+    {
+        if (!IsName(slug) || !IsName(file)) return null;
+        var path = Path.GetFullPath(Path.Combine(library, slug, "scene", file));
+        var root = Path.GetFullPath(library);
+        if (!root.EndsWith(Path.DirectorySeparatorChar)) root += Path.DirectorySeparatorChar;
+        if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return null;
+        return File.Exists(path) ? path : null;
+    }
+
+    private static bool IsName(string s)
+        => s.Length is > 0 and <= 160
+           && s != "." && s != ".."
+           && s.IndexOfAny(Path.GetInvalidFileNameChars()) < 0
+           && !s.Contains("..", StringComparison.Ordinal);
+}
+
+internal sealed record Options(string AppDir, string SceneDir, string? Library, int Port, bool Lan, bool NewCert)
 {
     public static Options Parse(string[] args)
     {
-        string? app = null, scene = null;
+        string? app = null, scene = null, library = null;
         var port = 8765;
         var lan = false;
         var newCert = false;
@@ -127,6 +291,7 @@ internal sealed record Options(string AppDir, string SceneDir, int Port, bool La
             {
                 case "--app": app = args[++i]; break;
                 case "--scene": scene = args[++i]; break;
+                case "--library": library = args[++i]; break;
                 case "--port": port = int.Parse(args[++i]); break;
                 case "--lan": lan = true; break;
                 case "--new-cert": newCert = true; break;
@@ -134,7 +299,11 @@ internal sealed record Options(string AppDir, string SceneDir, int Port, bool La
         }
         app ??= Path.Combine(AppContext.BaseDirectory, "vr-web");
         scene ??= Path.Combine(AppContext.BaseDirectory, "export");
-        return new Options(Path.GetFullPath(app), Path.GetFullPath(scene), port, lan, newCert);
+        return new Options(
+            Path.GetFullPath(app),
+            Path.GetFullPath(scene),
+            string.IsNullOrWhiteSpace(library) ? null : Path.GetFullPath(library),
+            port, lan, newCert);
     }
 }
 

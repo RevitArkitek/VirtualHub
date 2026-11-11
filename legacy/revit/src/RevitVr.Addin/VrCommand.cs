@@ -69,20 +69,28 @@ public sealed class VrCommand : IExternalCommand
             "",
         };
 
+        // Land on the model just exported, not the library: the click that started this should end
+        // with the model in front of you. The viewer's ‹ Library button goes back to the list.
+        var viewerPath = string.IsNullOrEmpty(outcome.Slug)
+            ? "/"
+            : "/viewer.html?model=" + Uri.EscapeDataString(outcome.Slug);
+
         if (deviceOk)
         {
             var reversed = Adb.Reverse(port, out var revMsg);
             var openMsg = "";
-            var opened = reversed && Adb.Open($"http://localhost:{port}/", out openMsg);
+            var opened = reversed && Adb.Open($"http://localhost:{port}{viewerPath}", out openMsg);
             lines.Add(reversed ? $"Headset: {deviceName}" : "Headset: " + revMsg);
             if (opened)
             {
                 lines.Add("Viewer opened on the headset. Put it on and press Enter VR.");
+                lines.Add($"Model library: http://localhost:{port}/");
             }
             else
             {
                 lines.Add($"Could not launch the browser automatically. Open this on the headset:");
-                lines.Add($"    http://localhost:{port}/");
+                lines.Add($"    http://localhost:{port}{viewerPath}");
+                lines.Add($"(library: http://localhost:{port}/)");
                 lines.Add($"({openMsg})");
             }
         }
@@ -94,7 +102,7 @@ public sealed class VrCommand : IExternalCommand
             lines.Add("Put the headset on, exit Link, and open this in the Quest browser:");
             lines.Add("");
             foreach (var ip in ips.Take(2))
-                lines.Add($"    https://{ip}:{port}/");
+                lines.Add($"    https://{ip}:{port + 1}{viewerPath}");
             if (ips.Count > 1)
                 lines.Add("(use the 192.168.x one — the other is a VPN adapter)");
             lines.Add("");

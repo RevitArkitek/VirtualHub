@@ -80,7 +80,8 @@ public sealed record ExportOutcome(
     int Materials,
     int Segments,
     int Openings,
-    long GlbBytes);
+    long GlbBytes,
+    string Slug = "");
 
 public static class ExportJob
 {
@@ -227,6 +228,34 @@ public static class ExportJob
         if (builder.TriangleCount == 0)
             return outcome with { Ok = false, Message = "Nothing exported. Is the view empty or cropped out?" };
 
+        // Publish into the shared library the homepage lists. Keyed by the document's file name,
+        // so this export replaces the previous card for the same project rather than adding one.
+        // A failure here must not fail the export: the scene is written and walkable either way.
+        try
+        {
+            var slug = ModelLibrary.Publish(
+                dir,
+                doc.Title,
+                string.IsNullOrWhiteSpace(doc.PathName) ? null : doc.PathName,
+                view.Name,
+                builder.TriangleCount,
+                int.TryParse(doc.Application.VersionNumber, out var rv) ? rv : 0);
+
+            outcome = outcome with
+            {
+                Slug = slug,
+                Message = outcome.Message + $"\nLibrary: {slug} — in the model list.",
+            };
+        }
+        catch (Exception ex)
+        {
+            App.Log("library publish failed: " + ex);
+            outcome = outcome with
+            {
+                Message = outcome.Message + "\nWARNING: could not add this export to the model library: " + ex.Message,
+            };
+        }
+
         return outcome;
     }
 
@@ -328,8 +357,9 @@ public static class ExportJob
             };
             psi.ArgumentList.Add("--app"); psi.ArgumentList.Add(web);
             psi.ArgumentList.Add("--scene"); psi.ArgumentList.Add(Paths.ExportDir);
+            psi.ArgumentList.Add("--library"); psi.ArgumentList.Add(ModelLibrary.Root);
             psi.ArgumentList.Add("--port"); psi.ArgumentList.Add(port.ToString());
-            if (lan) psi.ArgumentList.Add("--lan");
+            // no --lan: the server always listens on both http (loopback) and https (LAN).
             Process.Start(psi);
         }
         catch (Exception ex)
@@ -374,8 +404,14 @@ public static class ExportJob
                         var json = http.GetStringAsync($"{s}://127.0.0.1:{p}/api/status").GetAwaiter().GetResult();
                         using var d = JsonDocument.Parse(json);
                         if (!d.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean()) continue;
-                        var transport = d.RootElement.TryGetProperty("transport", out var t) ? t.GetString() : "http";
-                        if (transport != want) continue;
+                        // A server from before the library existed answers here too, but its "/" is a
+                        // single scene and not the model list. Reusing it would open the wrong page.
+                        if (!d.RootElement.TryGetProperty("library", out var lib) ||
+                            lib.ValueKind != JsonValueKind.String) continue;
+                        // The headset on Wi-Fi needs the https listener; adb needs only the http one.
+                        if (want == "https" &&
+                            !(d.RootElement.TryGetProperty("https", out var h) &&
+                              h.ValueKind == JsonValueKind.True)) continue;
                         port = p;
                         return d.RootElement.Clone();
                     }

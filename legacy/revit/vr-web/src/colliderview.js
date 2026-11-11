@@ -19,6 +19,94 @@ const KINDS = {
   other: { color: 0x9aa4b2, opacity: 0.22 },
 };
 
+// Where you can stand is drawn as a green plane: a floor polygon, or a terrain
+// triangle (a floor with a stairwell hole is triangulated, so that is where the
+// storey above a stair actually lives).
+// A wall run the exporter dropped because a tag or a layer said "opening".
+// Drawn so a tag that did nothing, or one that ate a wall, is visible.
+const OPENED = { color: 0xff4de0, opacity: 0.34 };
+
+const GROUND = {
+  surface: { color: 0x35d05a, opacity: 0.18 },
+  terrain: { color: 0x1f9e44, opacity: 0.22 },
+};
+
+/** A flat green plane per floor polygon, triangulated so openings and concave
+ *  outlines stay true to the plan. */
+function groundFromPolygons(surfaces) {
+  const positions = [];
+  for (const s of surfaces || []) {
+    // Two exporters, one viewer: IngeTrazo emits the outline as `p` ([x,z,…]), RevitVR emits an
+    // axis-aligned rect (minX/minZ/maxX/maxZ). Both are floor polygons; a rect is just its corners.
+    const flat = Array.isArray(s.p) && s.p.length >= 6
+      ? s.p
+      : (s.minX != null && Number.isFinite(s.minX)
+          ? [s.minX, s.minZ, s.maxX, s.minZ, s.maxX, s.maxZ, s.minX, s.maxZ]
+          : null);
+    if (!flat) continue;
+    const contour = [];
+    for (let i = 0; i < flat.length; i += 2) {
+      contour.push(new THREE.Vector2(flat[i], flat[i + 1]));
+    }
+    let faces = [];
+    try {
+      faces = THREE.ShapeUtils.triangulateShape(contour, []);
+    } catch (e) {
+      faces = [];
+    }
+    if (!faces.length) continue;
+    const y = s.y + 0.005;              // a hair above the model's own floor
+    for (const [a, b, c] of faces) {
+      for (const idx of [a, b, c]) {
+        const p = contour[idx];
+        positions.push(p.x, y, p.y);
+      }
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+/** A green plane per terrain triangle — sloped ground, and floors with holes. */
+function groundFromTerrain(terrain) {
+  const positions = [];
+  for (const t of terrain || []) {
+    if (!t || t.length < 9) continue;
+    positions.push(t[0], t[1] + 0.005, t[2],
+                   t[3], t[4] + 0.005, t[5],
+                   t[6], t[7] + 0.005, t[8]);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function groundMesh(geo, style, name, count) {
+  if (!count) { geo.dispose(); return null; }
+  const material = new THREE.MeshBasicMaterial({
+    color: style.color,
+    transparent: true,
+    opacity: style.opacity,
+    depthWrite: false,
+    // No depth test on purpose: this is a debug overlay, and a floor's finish
+    // layer sits a few centimetres above the analytic surface the engine uses.
+    // Depth-tested, the green plane hides under the model's own floor exactly
+    // where you most want to see it. It draws over the model and under the
+    // collider boxes (renderOrder).
+    depthTest: false,
+    side: THREE.DoubleSide,
+    toneMapped: false,
+  });
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.name = name;
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 999;               // under the collider boxes, over the model
+  return mesh;
+}
+
 /**
  * Railings are the only segments the exporter stamps with a sourceId. Walls and furniture are
  * told apart by height: a wall spans a storey, a table does not.
@@ -99,7 +187,54 @@ export function buildColliderView(segments, options = {}) {
     group.add(mesh);
   }
 
+  // Magenta boxes: wall runs removed as openings, so a door tag or layer you
+  // just applied proves itself (or shows it removed the wrong thing).
+  const opened = options.openings || [];
+  if (opened.length) {
+    const material = new THREE.MeshBasicMaterial({
+      color: OPENED.color,
+      transparent: true,
+      opacity: OPENED.opacity,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      toneMapped: false,
+    });
+    const mesh = new THREE.InstancedMesh(unit, material, opened.length);
+    mesh.name = 'colliders-openings';
+    mesh.frustumCulled = false;
+    mesh.renderOrder = 1000;
+    opened.forEach((o, i) => {
+      const dx = o.x2 - o.x1;
+      const dz = o.z2 - o.z1;
+      const length = Math.hypot(dx, dz);
+      euler.set(0, Math.atan2(-dz, dx), 0);
+      quat.setFromEuler(euler);
+      pos.set((o.x1 + o.x2) / 2, ((o.y0 ?? 0) + (o.y1 ?? 0)) / 2,
+              (o.z1 + o.z2) / 2);
+      scale.set(Math.max(length, 0.05),
+                Math.max((o.y1 ?? 0) - (o.y0 ?? 0), 0.05), 0.12);
+      matrices.compose(pos, quat, scale);
+      mesh.setMatrixAt(i, matrices);
+    });
+    mesh.instanceMatrix.needsUpdate = true;
+    group.add(mesh);
+  }
+
+  // Green planes: where the collision engine will let you stand. Pass
+  // `surfaces` and `terrain` from the manifest to see them.
+  const surfaces = options.surfaces || [];
+  const terrain = options.terrain || [];
+  const surfaceMesh = groundMesh(groundFromPolygons(surfaces), GROUND.surface,
+                                 'colliders-surfaces', surfaces.length);
+  if (surfaceMesh) group.add(surfaceMesh);
+  const terrainMesh = groundMesh(groundFromTerrain(terrain), GROUND.terrain,
+                                 'colliders-terrain', terrain.length);
+  if (terrainMesh) group.add(terrainMesh);
+
   group.userData.count = (segments || []).filter((s) => s.solid !== false).length;
+  group.userData.surfaces = surfaces.length;
+  group.userData.terrain = terrain.length;
+  group.userData.openings = opened.length;
   group.userData.kinds = [...buckets.keys()];
   return group;
 }

@@ -26,22 +26,45 @@ if (-not $RevitDir) { $RevitDir = "C:\Program Files\Autodesk\Revit $RevitYear" }
 $RevitDir = $RevitDir.TrimEnd('\', '/') + '/'
 $RevitDirFs = $RevitDir.Replace('/', '\')
 
-$dotnet = (Get-Command dotnet -ErrorAction SilentlyContinue)
-if (-not $dotnet) {
-  # A user-local SDK (dotnet-install.ps1 into ~\.dotnet) is not on PATH until the next logon.
-  $localDotnet = Join-Path $HOME ".dotnet\dotnet.exe"
-  if (Test-Path $localDotnet) {
-    $dotnet = $localDotnet
-    $env:PATH = "$(Split-Path $localDotnet);$env:PATH"
-  }
-}
-if (-not $dotnet) { throw "dotnet SDK not found on PATH." }
-if (-not (& dotnet --list-sdks)) {
-  throw "dotnet is installed but has no SDK (runtime only). Install one: https://aka.ms/dotnet/download"
-}
 if (-not (Test-Path (Join-Path $RevitDirFs "RevitAPI.dll"))) {
   throw "RevitAPI.dll not found in '$RevitDirFs'. Pass -RevitDir explicitly."
 }
+
+# Revit 2025.5+ and Revit 2026 run on .NET 10; earlier 2025 builds were .NET 8. Read the runtime
+# Revit itself declares instead of guessing: an add-in compiled for the wrong runtime fails with
+# CS1705 before anything else can be checked.
+$revitTfm = "net8.0-windows"
+$runtimeCfg = Join-Path $RevitDirFs "RevitAPI.runtimeconfig.json"
+if (Test-Path $runtimeCfg) {
+  try {
+    $declared = (Get-Content $runtimeCfg -Raw | ConvertFrom-Json).runtimeOptions.tfm
+    if ($declared) { $revitTfm = "$declared-windows" }
+  } catch { Write-Warning "could not read $runtimeCfg; assuming $revitTfm" }
+}
+Write-Host "==> Revit runtime: $revitTfm" -ForegroundColor Cyan
+
+# Pick a dotnet whose SDK can target that runtime. A user-local SDK (dotnet-install.ps1 into
+# ~\.dotnet) is not on PATH until the next logon, and the machine-wide SDK may be older than
+# Revit's runtime — both are normal here.
+$tfmMajor = [int]($revitTfm -replace '^net(\d+).*$', '$1')
+$dotnet = $null
+$candidates = @()
+$onPath = Get-Command dotnet -ErrorAction SilentlyContinue
+if ($onPath) { $candidates += $onPath.Source }
+$localDotnet = Join-Path $HOME ".dotnet\dotnet.exe"
+if (Test-Path $localDotnet) { $candidates += $localDotnet }
+
+foreach ($cand in $candidates) {
+  foreach ($line in @(& $cand --list-sdks 2>$null)) {
+    if ($line -match '^(\d+)\.' -and [int]$Matches[1] -ge $tfmMajor) { $dotnet = $cand; break }
+  }
+  if ($dotnet) { break }
+}
+if (-not $dotnet) {
+  throw "No .NET SDK found that targets $revitTfm. Install one: https://aka.ms/dotnet/download"
+}
+$env:PATH = "$(Split-Path $dotnet);$env:PATH"
+Write-Host "==> dotnet: $dotnet" -ForegroundColor Cyan
 
 $dist  = Join-Path $root "dist"
 $addin = Join-Path $dist "addin"
@@ -52,10 +75,11 @@ New-Item -ItemType Directory -Path $dist, $addin -Force | Out-Null
 
 Write-Host "==> build core + add-in (Revit $RevitYear)" -ForegroundColor Cyan
 & dotnet build (Join-Path $root "src/RevitVr.Addin/RevitVr.Addin.csproj") `
-    -c Release -p:RevitDir="$RevitDir" -p:RevitApiVersion=$RevitYear --nologo -v q
+    -c Release -p:RevitDir="$RevitDir" -p:RevitApiVersion=$RevitYear `
+    -p:TargetFramework=$revitTfm --nologo -v q
 if ($LASTEXITCODE -ne 0) { throw "add-in build failed" }
 
-$addinOut = Join-Path $root "src/RevitVr.Addin/bin/Release/net8.0-windows"
+$addinOut = Join-Path $root "src/RevitVr.Addin/bin/Release/$revitTfm"
 Copy-Item (Join-Path $addinOut "RevitVr.Addin.dll") $addin -Force
 Copy-Item (Join-Path $addinOut "RevitVr.Core.dll")  $addin -Force
 if (Test-Path (Join-Path $addinOut "RevitVr.Addin.deps.json")) {

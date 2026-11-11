@@ -1,7 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <!-- Revit 2025.5+ and 2026 run on .NET 10; earlier 2025 builds were .NET 8. build.ps1 reads
+         RevitAPI.runtimeconfig.json and passes the matching TFM, so this default only applies to a
+         bare `dotnet build`. -->
+    <TargetFramework Condition="'$(TargetFramework)' == ''">net10.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
