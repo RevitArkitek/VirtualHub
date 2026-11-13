@@ -5,6 +5,7 @@
     .\serve-library.ps1 -Headset     also open it on the Quest (adb, or the https address)
     .\serve-library.ps1 -Port 8765   another port
     .\serve-library.ps1 -Stop        stop a library server this script started
+    .\serve-library.ps1 -InstallShortcut   add Model Library to the desktop and Start menu
 
   The server listens twice: http on 127.0.0.1:<port> (this PC, and the headset over adb reverse)
   and https on 0.0.0.0:<port+1> (the headset over Wi-Fi, where WebXR needs a secure origin).
@@ -23,7 +24,8 @@ param(
   [switch]$Headset,
   [switch]$Lan,
   [switch]$NoBrowser,
-  [switch]$Stop
+  [switch]$Stop,
+  [switch]$InstallShortcut
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,6 +70,31 @@ if (-not $web) {
 $web = (Resolve-Path $web).Path
 
 New-Item -ItemType Directory -Force -Path $library, $scene | Out-Null
+
+# ---- optional: a desktop / Start menu shortcut ---------------------------------
+# Double-clicking it starts the server and opens the page, with no CAD app involved.
+if ($InstallShortcut) {
+  $shell = New-Object -ComObject WScript.Shell
+  $powershellExe = Join-Path $env:SystemRoot "System32/WindowsPowerShell/v1.0/powershell.exe"
+  $arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+  $iconCandidate = Join-Path $PSScriptRoot "../web/favicon.ico"
+  $icon = if (Test-Path $iconCandidate) { (Resolve-Path $iconCandidate).Path } else { $null }
+  $places = @(
+    [Environment]::GetFolderPath("Desktop"),
+    (Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs")
+  )
+  foreach ($place in ($places | Where-Object { $_ } | Select-Object -Unique)) {
+    New-Item -ItemType Directory -Force -Path $place | Out-Null
+    $lnk = $shell.CreateShortcut((Join-Path $place "Model Library.lnk"))
+    $lnk.TargetPath = $powershellExe
+    $lnk.Arguments = $arguments
+    $lnk.WorkingDirectory = $PSScriptRoot
+    $lnk.Description = "Start the VR model library and open it in the browser"
+    if ($icon) { $lnk.IconLocation = "$icon,0" }
+    $lnk.Save()
+    Write-Host "shortcut -> $(Join-Path $place 'Model Library.lnk')"
+  }
+}
 
 # ---- is it already up? -------------------------------------------------------
 function Test-LibraryServer([int]$p) {

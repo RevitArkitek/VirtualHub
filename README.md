@@ -68,7 +68,11 @@ rule, not a setting here.
 dotnet run --project server/RevitVr.Server -- --app web --library "$env:LOCALAPPDATA\VRHub\library"
 ```
 
-or double-click the **Model Library** shortcut that `build.ps1` can install.
+or add a **Model Library** shortcut to the desktop and Start menu:
+
+```powershell
+.\tools\serve-library.ps1 -InstallShortcut
+```
 
 ## The model library
 
