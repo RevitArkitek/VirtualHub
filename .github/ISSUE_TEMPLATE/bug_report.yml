@@ -1,0 +1,65 @@
+name: Bug report
+description: Something does not work — export, viewer, library, or headset.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not attach a client's model, screenshot or file path. The synthetic demo scene
+        (`tools/demogen`) reproduces most viewer problems without exposing anything.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where does it go wrong?
+      options:
+        - Revit plugin (export, ribbon, publish)
+        - IngeTrazo plugin (export, publish)
+        - Model library homepage
+        - Viewer (walking, collision, controls)
+        - Headset connection (certificate, adb, WebXR)
+        - Build or tests
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens, and what you expected
+      placeholder: Pressing Enter VR exports, but the headset shows a 404.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a 3D view
+        2. Add-Ins ▸ RevitVR ▸ Enter VR
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: report
+    attributes:
+      label: Export report, if this is an export problem
+      description: The dialog prints counts and warnings; they usually identify the cause on their own.
+      render: text
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: OS, CAD app and version, headset, and the VirtualHub commit or release.
+      placeholder: Windows 11, Revit 2025.5, Quest 3, v0.1.0
+
+  - type: checkboxes
+    id: tried
+    attributes:
+      label: Already checked
+      options:
+        - label: The server was restarted from the current build
+        - label: I tried both the adb path and the https address
+        - label: I reproduced it with the synthetic demo scene

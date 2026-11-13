@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Everything here is Revit-free: the add-in itself needs Autodesk's assemblies, which are not
+      # redistributable, so it is built locally by the maintainer (plugins/revit/build.ps1).
+      - name: Build .NET
+        run: |
+          dotnet build server/RevitVr.Server/RevitVr.Server.csproj -c Release --nologo
+          $projects = @(
+            'tools/test-wallcut', 'tools/test-planrect', 'tools/test-ao',
+            'tools/test-textures', 'tools/demogen'
+          )
+          foreach ($p in $projects) { dotnet build $p -c Release --nologo }
+
+      - name: .NET assertions
+        run: |
+          dotnet run --project tools/test-wallcut -c Release --no-build
+          dotnet run --project tools/test-planrect -c Release --no-build
+          dotnet run --project tools/test-ao -c Release --no-build
+          dotnet run --project tools/test-textures -c Release --no-build
+
+      - name: Synthetic scene, collision and glTF validity
+        run: |
+          dotnet run --project tools/demogen -c Release --no-build -- runtime/export
+          node tools/test-collision.mjs runtime/export/colliders.json
+          npm --prefix tools/gltfcheck ci
+          node tools/gltfcheck/validate.mjs runtime/export/scene.glb
+
+      - name: Python plugin
+        run: |
+          python -m compileall -q plugins/ingetrazo
+          python tools/ingetrazo/test_derive.py
+          python tools/ingetrazo/test_library.py
+
+      - name: Both servers, one library
+        run: |
+          dotnet publish server/RevitVr.Server/RevitVr.Server.csproj -c Release -r win-x64 `
+            --self-contained true -p:PublishSingleFile=true -o dist/server
+          python tools/conformance.py --server dist/server/RevitVr.Server.exe
+
+      - name: Revit add-in (skipped on hosted runners)
+        run: |
+          Write-Host "The add-in needs RevitAPI.dll from a local Revit install; it cannot be built here."
+          Write-Host "Maintainers: run plugins/revit/build.ps1 and tools/addincheck on a machine with Revit."

@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest a capability or a change in behaviour.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the situation in the product, not the implementation you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part?
+      options:
+        - Revit plugin
+        - IngeTrazo plugin
+        - Model library / homepage
+        - Viewer / controls
+        - Headset delivery
+        - Tooling, tests or docs
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including "live with it", if the cost is not worth the benefit.

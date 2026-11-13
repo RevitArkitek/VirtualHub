@@ -1,0 +1,21 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.{cs,csproj,props,targets}]
+indent_size = 4
+
+# Windows PowerShell 5.1 reads .ps1 as ANSI unless the file has a BOM, so a UTF-8 punctuation mark
+# becomes a smart quote and breaks parsing. A BOM keeps non-ASCII safe; plain ASCII is still better.
+[*.{ps1,psm1}]
+charset = utf-8-bom
+end_of_line = crlf
+
+[*.md]
+trim_trailing_whitespace = false
