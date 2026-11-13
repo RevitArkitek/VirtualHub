@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "VirtualHub library entry metadata",
+  "description": "meta.json inside %LOCALAPPDATA%\\VRHub\\library\\<slug>\\, written by either plugin after a successful publish. The homepage lists an entry only when meta.json, scene/scene.glb and scene/colliders.json all exist.",
+  "type": "object",
+  "required": ["slug", "name", "source", "exportedUtc"],
+  "properties": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$",
+      "description": "Folder name; a slug of the document name, so re-exporting the same document replaces this entry."
+    },
+    "name": {
+      "type": "string",
+      "description": "Display name on the card. The document name, without the application's own name prefixed."
+    },
+    "source": { "enum": ["revit", "ingetrazo", "other"] },
+    "sourceLabel": { "type": "string", "description": "e.g. 'Revit 2025' or 'IngeTrazo', shown as the card's pill." },
+    "fileName": { "type": ["string", "null"], "description": "Source file name including extension, when the host exposes it." },
+    "filePath": { "type": ["string", "null"] },
+    "view": { "type": ["string", "null"], "description": "Revit 3D view name; null for IngeTrazo." },
+    "exportedUtc": { "type": "string", "description": "ISO-8601 timestamp; the card list is sorted by it, newest first." },
+    "triangles": { "type": ["integer", "null"], "minimum": 0 },
+    "generator": { "type": "string" }
+  }
+}

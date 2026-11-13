@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- windows + WPF because the texture encoder is compiled from the add-in's own source file:
+         this tests the shipped code, not a copy of it. -->
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>test-textures</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\plugins\revit\RevitVr.Core\RevitVr.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="../../plugins/revit/RevitVr.Addin/Export/TextureEncoder.cs" Link="TextureEncoder.cs" />
+    <Compile Include="../../plugins/revit/RevitVr.Addin/Export/TexturePathResolver.cs" Link="TexturePathResolver.cs" />
+    <Compile Include="../../plugins/revit/RevitVr.Addin/Export/ExportSettings.cs" Link="ExportSettings.cs" />
+  </ItemGroup>
+</Project>

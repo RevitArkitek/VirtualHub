@@ -1,6 +1,0 @@
-# Let git normalise line endings; these are not text and must never be converted.
-* text=auto
-*.png binary
-*.glb binary
-*.dll binary
-*.pfx binary

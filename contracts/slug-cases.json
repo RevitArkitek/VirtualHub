@@ -1,0 +1,14 @@
+{
+  "comment": "One source of truth for how a document name becomes a library slug. Both languages must satisfy every case: plugins/revit (C# ModelLibrary.Slugify) and plugins/ingetrazo (Python slugify). Checked by tools/addincheck and tools/ingetrazo/test_library.py.",
+  "cases": [
+    { "input": "196 SW-2025", "expected": "196-sw-2025", "why": "spaces and punctuation become single dashes" },
+    { "input": "Casa Árboles", "expected": "casa-arboles", "why": "accents fold instead of vanishing" },
+    { "input": "Christian-2025", "expected": "christian-2025" },
+    { "input": "Farnsworth House", "expected": "farnsworth-house" },
+    { "input": "Tower A - Phase 2", "expected": "tower-a-phase-2", "why": "runs of separators collapse" },
+    { "input": "ÉCOLE—Nord", "expected": "ecole-nord", "why": "non-ASCII punctuation is a separator, not a letter" },
+    { "input": "  ", "expected": "model", "why": "an empty name still needs a folder" },
+    { "input": "Plan_Level 2 (final).rvt", "expected": "plan-level-2-final-rvt" },
+    { "input": "Casa en los Arboles Rehabilitacion Integral Fase Tres Edificio Norte", "expected": "casa-en-los-arboles-rehabilitacion-integral-fase-tres-edific", "why": "capped at 60 characters" }
+  ]
+}

@@ -1,0 +1,10 @@
+# Let git normalise line endings; these are not text and must never be converted.
+* text=auto
+*.png binary
+*.glb binary
+*.dll binary
+*.pfx binary
+
+# Windows scripts are CRLF in the working tree; the repository keeps LF like everything else.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf

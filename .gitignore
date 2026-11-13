@@ -1,0 +1,33 @@
+# ---------------------------------------------------------------- build output
+[Bb]in/
+[Oo]bj/
+/dist/
+.vs/
+*.user
+*.suo
+
+# ---------------------------------------------------------------- runtime state
+# exported scenes, server logs, the generated TLS certificate and its pfx
+/runtime/
+*.log
+__pycache__/
+*.pyc
+# scratch output from the debug tools
+runtime-*.json
+runtime-*/
+*.bak
+# certificates generated per machine
+cert.pem
+key.pem
+cert.json
+
+# ---------------------------------------------------------------- node
+node_modules/
+
+# ---------------------------------------------------------------- local history import
+.import/
+
+# ---------------------------------------------------------------- os
+Thumbs.db
+desktop.ini
+.DS_Store
