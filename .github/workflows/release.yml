@@ -1,13 +1,20 @@
 name: release
 
 # Packages what a hosted runner can build: the standalone server + web app, and the IngeTrazo plugin.
-# The Revit add-in package needs Autodesk's assemblies, so it is zipped locally by the maintainer
-# (plugins/revit/build.ps1 assembles dist\) and attached to the release by hand.
+# The Revit add-in needs Autodesk's assemblies, so its package is built on a machine with Revit and
+# attached by hand:
+#
+#   .\plugins\revit\build.ps1 -NoInstall
+#   .\tools\package-release.ps1 -Version v0.1.0 -WithRevit
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version label for the packages'
+        default: 'dev'
 
 permissions:
   contents: write
@@ -22,34 +29,25 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Publish server
+      - name: Build the release assets
         run: |
-          dotnet publish server/RevitVr.Server/RevitVr.Server.csproj -c Release -r win-x64 `
-            --self-contained true -p:PublishSingleFile=true `
-            -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true `
-            -o dist/server
-
-      - name: Stage packages
-        run: |
-          $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { 'dev' }
-          New-Item -ItemType Directory -Force pkg/server, pkg/ingetrazo/plugins/ingetrazo, pkg/ingetrazo/web | Out-Null
-          Copy-Item dist/server/* pkg/server/server -Recurse -Force -ErrorAction SilentlyContinue
-          Copy-Item web/* pkg/server/web -Recurse -Force
-          Copy-Item plugins/ingetrazo/* pkg/ingetrazo/plugins/ingetrazo -Recurse -Force
-          Copy-Item web/* pkg/ingetrazo/web -Recurse -Force
-          Compress-Archive -Path pkg/server/* -DestinationPath "virtualhub-server-$tag.zip" -Force
-          Compress-Archive -Path pkg/ingetrazo/* -DestinationPath "virtualhub-ingetrazo-$tag.zip" -Force
-          Get-ChildItem *.zip | Format-Table Name, Length
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { '${{ inputs.version }}' }
+          .\tools\package-release.ps1 -Version $version
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: packages
-          path: '*.zip'
+          path: |
+            release/**/*.zip
+            release/**/SHA256SUMS.txt
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$env:GITHUB_REF_NAME" *.zip --generate-notes --title "$env:GITHUB_REF_NAME"
+          $files = @(Get-ChildItem "release/$env:VERSION/*.zip") +
+                   @(Get-Item "release/$env:VERSION/SHA256SUMS.txt")
+          gh release create "$env:VERSION" $files.FullName --generate-notes --title "$env:VERSION"

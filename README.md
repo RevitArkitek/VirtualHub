@@ -96,6 +96,7 @@ the metadata schema: [docs/library-format.md](docs/library-format.md).
 | [docs/headset.md](docs/headset.md) | secure origins, adb vs Wi-Fi, certificates, firewall |
 | [docs/revit.md](docs/revit.md) | the Revit plugin's manual: export report, colliders, limits |
 | [docs/ingetrazo.md](docs/ingetrazo.md) | the IngeTrazo plugin's manual: derivation rules, limits |
+| [docs/releases.md](docs/releases.md) | what goes into a release, and what must never be attached |
 | [docs/spikes/](docs/spikes/) | experiments that decided what to build next |
 
 ## What is verified
