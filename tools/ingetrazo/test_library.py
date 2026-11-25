@@ -99,6 +99,7 @@ def get(path):
 
 status, body = get("/")
 check("homepage served", status == 200 and b"Model Library" in body, f"HTTP {status}")
+check("homepage has a search box", b'id="search"' in body, "search input missing from index.html")
 status, body = get("/api/models")
 payload = json.loads(body) if status == 200 else {}
 check("/api/models lists it", status == 200 and payload["models"][0]["slug"] == slug, f"HTTP {status}")

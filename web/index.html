@@ -15,12 +15,27 @@
       <p class="sub" id="sub">Loading the library…</p>
     </div>
     <div class="tools">
+      <div class="search">
+        <svg class="lens" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+          <circle cx="6.6" cy="6.6" r="4.6" />
+          <path d="M10 10l4 4" />
+        </svg>
+        <input id="search" type="search" placeholder="Search models" aria-label="Search models"
+          autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search" />
+        <button id="clearSearch" type="button" aria-label="Clear the search" hidden>&times;</button>
+      </div>
       <nav class="tabs" id="tabs" aria-label="Filter models by source"></nav>
       <button id="refresh" type="button">Refresh</button>
     </div>
   </header>
 
   <main id="grid" aria-live="polite"></main>
+
+  <section id="nomatch" hidden>
+    <h2>No models match</h2>
+    <p class="dim" id="nomatchText"></p>
+    <button id="nomatchClear" type="button">Clear search</button>
+  </section>
 
   <section id="empty" hidden>
     <h2>No models yet</h2>

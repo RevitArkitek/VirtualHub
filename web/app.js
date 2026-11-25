@@ -4,17 +4,22 @@
 // folder. Nothing is stored in this page, so an export made in Revit shows up here on refresh —
 // and the folder is the only source of truth, which is why deleting a model folder deletes its card.
 
-const state = { models: [], filter: 'all', loaded: false };
+const state = { models: [], filter: 'all', query: '', loaded: false };
 
 const els = {
   grid: document.getElementById('grid'),
   empty: document.getElementById('empty'),
   error: document.getElementById('error'),
   errorText: document.getElementById('errorText'),
+  nomatch: document.getElementById('nomatch'),
+  nomatchText: document.getElementById('nomatchText'),
+  nomatchClear: document.getElementById('nomatchClear'),
   sub: document.getElementById('sub'),
   tabs: document.getElementById('tabs'),
   foot: document.getElementById('foot'),
   refresh: document.getElementById('refresh'),
+  search: document.getElementById('search'),
+  clearSearch: document.getElementById('clearSearch'),
 };
 
 const SOURCES = [
@@ -129,21 +134,58 @@ function renderTabs() {
   }
 }
 
-function render() {
-  renderTabs();
+// Everything a card says about the model itself, lowercased, so a query like "level 2" matches on
+// any two words in any order. The source pill is deliberately left out: the tabs already filter by
+// plugin, and matching it here would make "revit" a search term as well as a filter.
+function haystack(model) {
+  return [
+    model.name, model.slug, model.fileName, model.view,
+  ].filter(Boolean).join(' ').toLowerCase();
+}
 
-  const shown = state.filter === 'all'
+function queryTokens() {
+  return state.query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+}
+
+function setQuery(value) {
+  state.query = value;
+  if (els.search.value !== value) els.search.value = value;
+  els.clearSearch.hidden = value === '';
+  renderList();                                   // typing should not rebuild the tabs under the pointer
+}
+
+function renderList() {
+  const tokens = queryTokens();
+  const bySource = state.filter === 'all'
     ? state.models
     : state.models.filter((m) => m.source === state.filter);
+  const shown = tokens.length
+    ? bySource.filter((m) => {
+        const hay = haystack(m);
+        return tokens.every((t) => hay.includes(t));
+      })
+    : bySource;
 
   els.grid.replaceChildren(...shown.map(card));
   els.empty.hidden = state.models.length > 0 || !state.loaded;
-  els.grid.hidden = state.models.length === 0 && state.loaded;
+  els.grid.hidden = shown.length === 0;
+  els.nomatch.hidden = !(state.loaded && state.models.length > 0 && shown.length === 0);
+  if (!els.nomatch.hidden) {
+    const q = state.query.trim();
+    const scope = state.filter === 'all' ? 'the library' : pillText({ source: state.filter });
+    els.nomatchText.textContent = q
+      ? 'Nothing in ' + scope + ' matches “' + q + '”. Searches model names, file names and view '
+        + 'names.'
+      : 'Nothing in ' + scope + ' to show.';
+  }
 
   if (!state.loaded) {
     els.sub.textContent = 'Loading the library…';
   } else if (state.models.length === 0) {
     els.sub.textContent = 'Nothing exported yet.';
+  } else if (tokens.length) {
+    els.sub.textContent = shown.length + ' of ' + bySource.length + ' '
+      + (bySource.length === 1 ? 'model' : 'models') + ' match';
   } else {
     const newest = state.models[0];
     els.sub.textContent = state.models.length === 1
@@ -157,6 +199,11 @@ function render() {
   els.foot.textContent = state.library
     ? 'Library folder: ' + state.library + ' — re-exporting a file replaces its card.'
     : 'Re-exporting a file replaces its card.';
+}
+
+function render() {
+  renderTabs();
+  renderList();
 }
 
 async function load() {
@@ -191,5 +238,33 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state.loaded) load();
 });
 els.refresh.addEventListener('click', load);
+
+els.search.addEventListener('input', () => setQuery(els.search.value));
+els.search.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    setQuery('');
+    els.search.blur();
+  }
+});
+els.clearSearch.addEventListener('click', () => {
+  setQuery('');
+  els.search.focus();
+});
+els.nomatchClear.addEventListener('click', () => {
+  setQuery('');
+  els.search.focus();
+});
+
+// "/" jumps to the search box, the way it does in a file manager — but not while typing a query
+// or with a modifier held, so it never eats a slash you meant to type.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+  e.preventDefault();
+  els.search.focus();
+  els.search.select();
+});
 
 load();

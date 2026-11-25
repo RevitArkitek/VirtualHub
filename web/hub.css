@@ -18,6 +18,22 @@ h1 { margin: 0 0 6px; font-size: 27px; font-weight: 650; letter-spacing: .01em; 
 .sub { margin: 0; color: var(--dim); font-size: 14px; line-height: 1.5; }
 .tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
+.search { display: flex; align-items: center; gap: 7px; padding: 0 8px 0 10px;
+  background: #0e151d; border: 1px solid var(--line); border-radius: 10px;
+  transition: border-color .15s; }
+.search:focus-within { border-color: var(--line-hot); }
+.search .lens { width: 14px; height: 14px; flex: 0 0 auto; fill: none; stroke: var(--faint);
+  stroke-width: 1.6; stroke-linecap: round; }
+.search:focus-within .lens { stroke: var(--accent); }
+.search input { width: 180px; max-width: 46vw; border: 0; background: transparent; color: var(--ink);
+  font: inherit; font-size: 13px; font-weight: 500; padding: 10px 0; outline: none; }
+.search input::placeholder { color: var(--faint); font-weight: 500; }
+.search input::-webkit-search-cancel-button, .search input::-webkit-search-decoration {
+  -webkit-appearance: none; appearance: none; }
+#clearSearch { border: 0; background: transparent; color: var(--faint); font: inherit; font-size: 17px;
+  line-height: 1; padding: 2px 3px; border-radius: 6px; cursor: pointer; }
+#clearSearch:hover { color: var(--ink); background: #1b2836; }
+
 .tabs { display: flex; gap: 6px; background: #0e151d; border: 1px solid var(--line);
   padding: 4px; border-radius: 10px; }
 .tabs button { border: 0; background: transparent; color: var(--dim); font: inherit; font-size: 13px;
@@ -62,10 +78,13 @@ h1 { margin: 0 0 6px; font-size: 27px; font-weight: 650; letter-spacing: .01em; 
 .cta .arrow { transition: transform .15s; }
 .card:hover .cta .arrow { transform: translateX(3px); }
 
-#empty, #error { padding: 26px 24px; border: 1px dashed var(--line); border-radius: 14px;
+#empty, #error, #nomatch { padding: 26px 24px; border: 1px dashed var(--line); border-radius: 14px;
   background: #0e141b; }
-#empty h2, #error h2 { margin: 0 0 10px; font-size: 18px; font-weight: 620; }
-#empty p, #error p { margin: 0 0 12px; color: var(--dim); font-size: 14px; line-height: 1.6; max-width: 62ch; }
+#empty h2, #error h2, #nomatch h2 { margin: 0 0 10px; font-size: 18px; font-weight: 620; }
+#empty p, #error p, #nomatch p { margin: 0 0 12px; color: var(--dim); font-size: 14px; line-height: 1.6; max-width: 62ch; }
+#nomatch button { border: 1px solid var(--line); background: #131b25; color: var(--dim); font: inherit;
+  font-size: 13px; font-weight: 600; padding: 9px 15px; border-radius: 9px; cursor: pointer; }
+#nomatch button:hover { color: var(--ink); border-color: var(--line-hot); }
 #empty ul { margin: 0 0 14px; padding-left: 20px; color: var(--dim); font-size: 14px; line-height: 1.8; }
 #empty strong { color: var(--ink); font-weight: 600; }
 .dim { color: var(--faint); }
@@ -76,6 +95,9 @@ footer code { color: var(--dim); }
 @media (max-width: 560px) {
   .wrap { padding: 20px 16px 30px; }
   header { align-items: flex-start; }
+  .search { flex: 1 1 100%; }
+  .search input { width: 100%; max-width: none; }
+  .tools { width: 100%; }
   h1 { font-size: 22px; }
   .card { min-height: 0; padding: 17px; }
   .name { font-size: 17px; }
