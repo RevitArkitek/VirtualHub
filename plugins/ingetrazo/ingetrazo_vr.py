@@ -32,6 +32,7 @@ import socket
 import subprocess
 import threading
 import time
+import traceback
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -544,7 +545,7 @@ def build_manifest(faces, *, name="IngeTrazo model", eye_height=EYE_HEIGHT,
         for q0, q1, y0, y1 in runs:
             why = None
             if face.get("opening"):
-                why = "layer:" + (face.get("layer") or "?")
+                why = "layer:" + str(face.get("layer") or "?")
             elif openings and in_opening((q0[0] + q1[0]) / 2,
                                          (q0[1] + q1[1]) / 2):
                 why = "opening"
@@ -753,13 +754,22 @@ def _triangulate(face):
 
 
 def _layer_of(entity):
-    """The layer name an entity carries, face or group."""
+    """The layer name an entity carries, face or group, as text.
+
+    A layer is a name, but an imported or older document can carry a number
+    where one belongs (one file has faces tagged ``2097``, a layer
+    the document does not even list). Text it here so a stray tag can never
+    take the export down.
+    """
     try:
         from core.layers import layer_of
-        return layer_of(entity) or ""
+        name = layer_of(entity)
     except Exception:
         attrs = getattr(entity, "attrs", None) or {}
-        return attrs.get("layer") or getattr(entity, "layer", None) or ""
+        name = attrs.get("layer") or getattr(entity, "layer", None)
+    if name is None:
+        return ""
+    return name if isinstance(name, str) else str(name)
 
 
 def _opening_hints(options):
@@ -772,7 +782,7 @@ def _opening_hints(options):
 
 
 def _is_opening_layer(name, hints):
-    n = (name or "").strip().lower()
+    n = (name if isinstance(name, str) else str(name or "")).strip().lower()
     return bool(n) and any(h in n for h in hints)
 
 
@@ -1550,8 +1560,16 @@ def _make_dialog(viewport):
                            options={"walls": self.untagged.isChecked(),
                                     "opening_layers": self.opening_layers.text()})
             except Exception as exc:
-                self.log.setPlainText(f"export failed: {exc}")
-                QMessageBox.warning(self, "IngeTrazo VR", f"Export failed:\n{exc}")
+                detail = traceback.format_exc()
+                saved = ""
+                try:
+                    log = export_dir() / "export-error.log"
+                    log.write_text(detail, encoding="utf-8")
+                    saved = f"\n\nfull traceback: {log}"
+                except Exception:
+                    pass
+                self.log.setPlainText(detail)
+                QMessageBox.warning(self, "IngeTrazo VR", f"Export failed:\n{exc}{saved}")
                 self.setEnabled(True)
                 return
             slug = m.get("_slug")

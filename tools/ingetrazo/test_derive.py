@@ -292,6 +292,24 @@ check("a custom hint list is used",
       vr._is_opening_layer("xx", ["xx"]) and
       not vr._is_opening_layer("Puerta", ["xx"]))
 
+print("18b. a numeric layer tag from an imported file does not break the reading")
+# One file export carries faces tagged 2097 — an int, not a layer
+# name, and a layer the document does not even list.
+class _Tagged:
+    attrs = {"layer": 2097}
+
+
+check("an int layer is not an opening", vr._is_opening_layer(2097, vr.OPENING_HINTS) is False)
+check("an int layer reads as text", vr._layer_of(_Tagged()) == "2097", vr._layer_of(_Tagged()))
+# The removal reason is recorded for the viewer overlay: an int layer there
+# used to be a TypeError of its own.
+odd_leaf = wall((2.0, 0.0), (2.9, 0.0), 0.0, 2.1)
+odd_leaf["layer"] = 2097
+odd_leaf["opening"] = True
+m = vr.build_manifest([floor(0, 0, 10, 4, 0), odd_leaf])
+check("a door leaf tagged with an int layer is dropped and its reason recorded",
+      any(o["why"] == "layer:2097" for o in m["openings_applied"]), m["openings_applied"])
+
 print("19. group layers are read from the group, nested ones included")
 
 
@@ -336,6 +354,11 @@ check("the top-level one counts", names.get("Ventanas") == 1, names)
 check("its box is its own geometry, not the parent's",
       any(abs(b[0] - 2.0) < 1e-6 and abs(b[2] - 2.9) < 1e-6 for b in boxes), boxes)
 check("a Muros group is not an opening", "Muros" not in names, names)
+
+numerical = _Group(2097, [(0.0, 0.0), (1.0, 0.0)])
+check("a group with an int layer reads as text", vr._layer_of(numerical) == "2097")
+check("a group on an int layer is not an opening",
+      vr._collect_group_openings(_Scene([numerical]), vr.OPENING_HINTS) == ([], {}))
 
 print()
 if fails:
