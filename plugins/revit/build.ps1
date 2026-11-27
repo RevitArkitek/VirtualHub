@@ -125,12 +125,14 @@ if (-not $NoInstall) {
   Write-Host "    installed. Restart Revit; the button is on Add-Ins > RevitVR." -ForegroundColor Green
 
   # Windows Firewall drops inbound connections to an unknown exe, so without this the headset
-  # cannot reach the HTTPS address on the local network.
+  # cannot reach the HTTPS address on the local network. The rule is per year: the server exe
+  # lives inside the install folder, so allowing Revit 2025's copy does nothing for 2026's.
+  $ruleName = "RevitVR (Revit $RevitYear)"
   $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
   if ($isAdmin) {
     try {
-      Get-NetFirewallRule -DisplayName 'RevitVR' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-      New-NetFirewallRule -DisplayName 'RevitVR' -Direction Inbound `
+      Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+      New-NetFirewallRule -DisplayName $ruleName -Direction Inbound `
         -Program (Join-Path $target 'server\RevitVr.Server.exe') `
         -Action Allow -Profile Private, Domain | Out-Null
       Write-Host "    firewall: inbound allowed for the headset on private networks" -ForegroundColor Green
