@@ -169,6 +169,49 @@ public static class PlanGeometry
         return best;
     }
 
+    /// <summary>
+    /// The nearest point on a polygon's boundary, or the point itself when it lies inside.
+    ///
+    /// Distance alone is not enough to place something on a railing: a rail's path is its sketch
+    /// line, and the rail itself can run beside it. This says where the geometry is, so a barrier
+    /// can be moved onto it instead of left behind on the path.
+    /// </summary>
+    public static (double X, double Y, double Distance) NearestPointOnPolygon(
+        IReadOnlyList<PlanPoint> polygon, double x, double y)
+    {
+        if (polygon.Count == 0) return (x, y, double.MaxValue);
+        if (polygon.Count == 1)
+        {
+            var only = polygon[0];
+            var d = Math.Sqrt((x - only.X) * (x - only.X) + (y - only.Y) * (y - only.Y));
+            return (only.X, only.Y, d);
+        }
+
+        if (polygon.Count == 2) return NearestOnSegment(polygon[0], polygon[1], x, y);
+        if (IsInside(polygon, x, y)) return (x, y, 0);
+
+        var best = (X: x, Y: y, Distance: double.MaxValue);
+        for (var i = 0; i < polygon.Count; i++)
+        {
+            var candidate = NearestOnSegment(polygon[i], polygon[(i + 1) % polygon.Count], x, y);
+            if (candidate.Distance < best.Distance) best = candidate;
+        }
+
+        return best;
+    }
+
+    private static (double X, double Y, double Distance) NearestOnSegment(
+        PlanPoint a, PlanPoint b, double x, double y)
+    {
+        var dx = b.X - a.X;
+        var dy = b.Y - a.Y;
+        var len2 = dx * dx + dy * dy;
+        var t = len2 < 1e-12 ? 0 : Math.Clamp(((x - a.X) * dx + (y - a.Y) * dy) / len2, 0, 1);
+        var px = a.X + dx * t;
+        var py = a.Y + dy * t;
+        return (px, py, Math.Sqrt((x - px) * (x - px) + (y - py) * (y - py)));
+    }
+
     /// <summary>Crossing-number test. Polygons here are convex quads or hulls.</summary>
     public static bool IsInside(IReadOnlyList<PlanPoint> polygon, double x, double y)
     {

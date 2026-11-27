@@ -63,7 +63,7 @@ likely to need extending in `TexturePathResolver.DefaultRoots()`.
 | `ambient occlusion: N vertices, R rays, A → B tris, T s` | `A → B` is the subdivision the bake needed; a big jump with `T` over a few seconds means the export was already heavy. The line reads `off (settings.ini)` when baking is disabled |
 | `texture scale: median X m per repeat (range A–B m)` | one repeat of the image per X metres of building — if this is tens of metres, a texture's unit was misread |
 | `wall runs → N wall segments, M obstacle boxes` | `M` zero means the obstacle categories aren't matching your families |
-| `railings: N found → M colliders (P height-measured, Q path-elevation, F footprint)` | `Q > 0` means those railings had no geometry to measure, so their barrier sits at the level's elevation and may be a storey off; `M` zero means railings exist but none produced a barrier |
+| `railings: N found → M colliders (P height-measured, C path-elevation, S surface-placed, F bbox, U unplaced, G footprint)` | `C > 0` means those railings had no geometry to measure, so their barrier sits at the level's elevation and may be a storey off; `S > 0` means a climbing railing's own geometry was unreadable (one aggregate solid for the whole element) so its barrier was stood on the treads under its path — it climbs the stair rather than walling it off; `U > 0` means those railings have no collider at all; `M` zero means railings exist but none produced a barrier |
 | `doors: N found, M cut` | `M < N` means some door hosts aren't resolving |
 | `surfaces, treads, terrain triangles` | zero treads/terrain means the geometry didn't produce walkable faces |
 | `light-source meshes skipped` | absent means the name heuristic missed your fixture families |
@@ -363,8 +363,19 @@ add-in derives collision from the *model data instead of the render mesh*:
   A railing whose geometry cannot be read is placed from its bounding box when its extent is a
   single flat railing, and left unplaced when that extent spans a stair flight or two storeys — a
   flat barrier there would wall off the stair. Both cases are counted in the export report.
+  A railing that *climbs* and whose geometry is one aggregate solid — coarse detail returns a
+  single solid for the whole element, whose minimum is the bottom of the flight and whose maximum
+  is its top, so no point along it can be measured — has its barrier stood on the treads or floors
+  under its own path instead, one sample every 600 mm, taken from the highest *outlined* surface
+  within 150 mm (widened to 1 m only when that finds nothing). Outlined matters: a floor slab is
+  recorded as its bounding rectangle, so a level's slab box covers the stair it does not really
+  stand over, and taking one as the base lifts the barrier onto the floor above. The result climbs
+  the stair in railing-height pieces. A footprint rectangle is never emitted for a climbing
+  railing, nor for one wider than 2.5 m: in the Silo three such rectangles 99 m² each and 4.7 m
+  tall enclosed every one of its 420 spiral-stair treads, so the whole stair tower was impassable.
   Every railing collider carries its `sourceId`, and `railings.json` beside the scene records what
-  each railing element produced (`measured` / `path-elevation` / `footprint` / `none`), how many
+  each railing element produced (`measured` / `path-3d` / `surface` / `bbox` / `footprint` /
+  `unplaced` / `no-collider`), how many
   path samples found no geometry, and its height — so a railing that misbehaves in the headset can
   be traced to an ElementId instead of guessed at from coordinates. A railing **type** carrying a
   yes/no parameter called `No Collider` is left out of the collision world entirely: railings get

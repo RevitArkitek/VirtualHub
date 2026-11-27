@@ -1,4 +1,4 @@
-using Autodesk.Revit.DB;
+﻿using Autodesk.Revit.DB;
 using Autodesk.Revit.DB.Architecture;
 using RevitVr.Core.Scene;
 
@@ -35,7 +35,12 @@ public sealed record RailingReport(
     float MinY,
     float MaxY,
     string Geometry,
-    int Solids);
+    int Solids,
+    int RayHits = 0,
+    int RayAggregates = 0,
+    string? PathDigest = null,
+    string? SpanDigest = null,
+    string? MissDigest = null);
 
 /// <summary>
 /// Derives the walkable world from Revit elements analytically instead of from the render mesh.
@@ -51,6 +56,17 @@ public static class ColliderExtractor
     private const double Ft = GeometryExporter.FeetToMetres;
     /// <summary>Tessellation density for curved faces, 0..1.</summary>
     private const double TessellationLod = 0.5;
+
+    // A path point that only finds a bracket or the edge of one rail is not a railing (feet).
+    private const double MinBarrierFt = 0.3 / Ft;
+
+    // How far below a railing's own top a walkable surface may be and still count as the thing it
+    // stands on — anything nearer is the slab above, not the floor below.
+    private const double SurfaceMinDropM = 0.25;
+
+    // How far from a railing's plan rectangle a path point may be and still be worth casting a
+    // ray at it (feet). Slack, not tolerance: the ray decides, this only skips distant solids.
+    private const double RayReachFt = 0.5;
 
     /// <summary>
     /// Categories that stop you walking through them. Doors are deliberately absent: a door gets
@@ -154,6 +170,7 @@ public static class ColliderExtractor
             $"{doorStats.Found} found, {doorStats.Matched} cut, {doorStats.Unmatched} unmatched; " +
             $"railings: {railings.Found} found → {railings.Boxes} colliders " +
             $"({railings.Measured} measured, {railings.FromPath3D} from a climbing path, " +
+            $"{railings.FromSurface} on the surface under the path, " +
             $"{railings.FromBox} bbox-placed, {railings.Unplaced} unplaced, " +
             $"{railings.FromFootprint} footprint, {railings.NoCollider} No Collider); " +
             $"{manifest.Surfaces.Count - treads} floor/roof surfaces, {treads} stair treads, " +
@@ -170,10 +187,31 @@ public static class ColliderExtractor
                 $"{dropped} railings lost path pieces where no railing geometry spanned the path; " +
                 "see railings.json for the element ids, and check those railings in the headset.");
 
+        if (railings.RayAggregateSamples > 0)
+            manifest.Warnings.Add(
+                $"{railings.RayAggregateSamples} railing samples found only aggregate geometry under the " +
+                "path and were stood on the floor beneath instead, which is right for a flat railing " +
+                "and wrong on a stair. Compare the railings' 'rayAggregates' in railings.json against " +
+                "their 'samples' to see how much of each barrier came that way.");
+
         if (railings.FromBox > 0)
             manifest.Warnings.Add(
                 $"{railings.FromBox} railings could not be measured from their geometry and were " +
                 "placed from their bounding box. Fine for a flat railing; check them in the headset.");
+
+        if (railings.FootprintRejected > 0)
+            manifest.Warnings.Add(
+                $"{railings.FootprintRejected} railings had no measurable geometry and a footprint too " +
+                "wide to be one railing — the fit was the sweep of a curved railing, which as a box " +
+                "would block the space it runs through. They have no collider; railings.json names " +
+                "them by ElementId.");
+
+        if (railings.FromSurface > 0)
+            manifest.Warnings.Add(
+                $"{railings.FromSurface} climbing railings could not be measured from their own " +
+                "geometry (coarse geometry returns one solid for the whole element) and their " +
+                "barriers were stood on the treads or floors under the path instead. They climb the " +
+                "stair; check where the barrier stops at the top and bottom of a flight.");
 
         if (railings.Unplaced > 0)
             manifest.Warnings.Add(
@@ -193,8 +231,9 @@ public static class ColliderExtractor
     private readonly record struct DoorStats(int Found, int Matched, int Unmatched);
 
     private readonly record struct RailingStats(
-        int Found, int NoCollider, int Measured, int FromPath3D, int FromBox, int Unplaced,
-        int FromFootprint, int Boxes, IReadOnlyList<RailingReport> Reports);
+        int Found, int NoCollider, int Measured, int FromPath3D, int FromSurface, int FromBox,
+        int Unplaced, int FromFootprint, int FootprintRejected, int Boxes, int RayAggregateSamples,
+        IReadOnlyList<RailingReport> Reports);
 
 
     /// <summary>
@@ -223,14 +262,10 @@ public static class ColliderExtractor
         // so this is what makes the barrier follow a stair instead of spanning the whole flight.
         const double SampleSpacingFt = 0.6 / Ft;
 
-        // A path point that only finds a bracket or the edge of one rail is not a railing.
-        const double MinBarrierFt = 0.3 / Ft;
-
-        // How far from a railing to look for the floor or tread it stands on, and how far below the
-        // railing's own top that floor must be. Coarse geometry spans whole railings, so its lowest
-        // point is the bottom of the stair — using it put barriers a storey below the railing.
+        // How far from a railing to look for the floor or tread it stands on. Coarse geometry
+        // spans whole railings, so its lowest point is the bottom of the stair — using it put
+        // barriers a storey below the railing.
         const double SurfaceRadiusM = 1.0;
-        const double SurfaceMinDropM = 0.25;
 
         // A solid taller than this is an aggregate standing in for whole sub-elements, so its
         // height says nothing about the railing at one point along it.
@@ -246,6 +281,12 @@ public static class ColliderExtractor
         // be turned into a single flat barrier.
         const double FlatRailingFt = 1.6 / Ft;
 
+        // A footprint rectangle is only a fair stand-in for a railing that is a couple of metres
+        // wide at most. Much wider and the fitted rectangle is the *sweep* of a curved railing:
+        // three of those in the Silo covered 99 m² each and stood 4.7 m tall, and every tread of
+        // its spiral stair sat inside one of them.
+        const double MaxFootprintWidthM = 2.5;
+
         // A path whose own Z varies is a real 3-D path — the railing climbs — and then its Z is
         // better evidence than the geometry. A spiral passes over the same plan position twice at
         // different heights, so a plan-only measurement cannot tell the turns apart and puts the
@@ -257,8 +298,11 @@ public static class ColliderExtractor
         var measured = 0;
         var fromPath3D = 0;
         var fromBox = 0;
+        var fromSurface = 0;
         var unplaced = 0;
         var fromFootprint = 0;
+        var footprintRejected = 0;
+        var rayAggregateTotal = 0;
         var boxes = 0;
         var emitted = new HashSet<(int, int, int, int, int, int)>();
         var reports = new List<RailingReport>();
@@ -293,8 +337,37 @@ public static class ColliderExtractor
             var pathLength = 0.0;
             var pathCurves = 0;
 
+            // The element's own extent, read once: it decides whether this railing climbs
+            // something, and a climbing railing cannot be described by any single flat box.
+            var bbox = element.get_BoundingBox(view) ?? element.get_BoundingBox(null);
+            var extentFt = bbox is null ? 0.0 : bbox.Max.Z - bbox.Min.Z;
+            var climbs = extentFt > FlatRailingFt;
+
+            // Which way each sample got its height, so the report can say what a barrier of this
+            // railing's actually rests on.
+            var usedSurface = false;
+            var usedMeasured = false;
+            var rayHits = 0;
+            var rayAggregates = 0;
+            var misses = new List<string>();
+
             var spans = new List<SolidSpan>();
             var haveGeometry = TryCollectSpans(element, view, spans, out var strategy);
+
+            // Coarse detail is a stand-in for the whole element — one blocky solid where the
+            // railing is really a rail plus panels — and on this model that stand-in leaves a 2 m
+            // stretch of railing with no geometry at all, so the barrier drops there. The
+            // as-modelled geometry is what the headset renders, so a flat railing that only has a
+            // coarse stand-in is re-read from it. Climbing railings keep their tier untouched.
+            if (!climbs && strategy is "coarse-visible" or "view-medium-visible")
+            {
+                var refined = new List<SolidSpan>();
+                if (TryCollectFineNonVisible(element, view, refined))
+                {
+                    spans = refined;
+                    strategy += "+fine";
+                }
+            }
 
             IList<Curve>? path = null;
             if (element is Railing railing)
@@ -338,26 +411,95 @@ public static class ColliderExtractor
                     {
                         samples++;
 
-                        var barrier = haveGeometry
-                            ? MeasureBarrier(spans, p.X, p.Y, MeasureToleranceFt, AggregateSpanFt)
-                            : null;
+                        // Two witnesses, and the exact one wins where it hits. The ray goes through
+                        // the railing's own solid, so it finds the rail where the plan rectangle
+                        // has already turned away; where the ray misses — a slender rail, a path a
+                        // few centimetres off the geometry — the rectangle test still answers, so
+                        // this only ever adds barriers, never takes one away.
+                        //
+                        // Flat railings only. On a climbing railing the ray finds the odd baluster
+                        // or bracket rather than a band of railing, and the floor it then stands the
+                        // barrier on is found by a rectangle-tolerant lookup that can pick the slab
+                        // of the level above — which slants the barrier across the stair. Stairs
+                        // keep the tread-based tier, which is measured at every sample.
+                        var ray = haveGeometry && !climbs
+                            ? MeasureBarrierByRay(spans, p.X, p.Y, AggregateSpanFt, RayReachFt)
+                            : default;
+
+                        if (ray.Hit) rayHits++;
+                        if (ray.AggregateOnly) rayAggregates++;
+
+                        // Follow the path. A railing's path is where the railing is: a plane cut
+                        // through the render mesh of a real model found the pipe 0.1–0.2 m from its
+                        // path, i.e. on it — while the element's *reported geometry* is a slanted
+                        // stand-in box whose edge wanders up to 0.7 m away. Moving the barrier onto
+                        // that box (an earlier attempt) dragged it off the railing along the run and
+                        // put a jog in at the end; the geometry is only good for heights.
+                        var barrier = ray.Hit && !ray.AggregateOnly
+                            ? (ray.Bottom, ray.Top)
+                            : haveGeometry
+                                ? MeasureBarrier(
+                                    spans, p.X, p.Y, MeasureToleranceFt, AggregateSpanFt)
+                                : null;
 
                         if (barrier is null)
                         {
-                            // no part of the railing spans this point: either the path runs past
-                            // the railing, or a baluster gap leaves nothing to measure
+                            // No part of the railing spans this point. Three reasons, and only two
+                            // of them are holes:
+                            //  - a climbing railing's coarse geometry is one aggregate solid, so
+                            //    the surface it stands on is the only local height there is;
+                            //  - a flat railing whose solids are aggregates where the path crosses
+                            //    them is still railing, so a barrier at floor height belongs there;
+                            //  - the point is inside the railing's own footprint but its stand-in
+                            //    geometry does not reach it, which is a gap in the *representation*,
+                            //    not in the railing: the pipe is drawn there and unmeasured.
+                            ColliderGeometry.PathSample? onSurface = null;
+
+                            if (climbs)
+                                onSurface = FromSurface(
+                                    manifest, p.X, p.Y, height, bbox?.Max.Z ?? p.Z, SurfaceMinDropM);
+                            else if ((ray.Hit && ray.AggregateOnly) ||
+                                     InsidePlanExtent(spans, p.X, p.Y, MeasureToleranceFt))
+                                onSurface = FromSurfaceOnFloor(
+                                    manifest, p.X, p.Y, height, bbox?.Max.Z ?? p.Z, SurfaceRadiusM);
+
+                            if (onSurface is { } surfaceSample)
+                            {
+                                samplesHere.Add(surfaceSample);
+                                usedSurface = true;
+                                continue;
+                            }
+
+                            // either the path runs past the railing, or a baluster gap leaves
+                            // nothing to measure
+                            if (misses.Count < 4)
+                            {
+                                var nearest = spans.Count == 0
+                                    ? -1.0
+                                    : spans.Min(s => PlanGeometry.DistanceToPolygon(s.Plan, p.X, p.Y));
+                                misses.Add($"({p.X:0.0},{p.Y:0.0}) d{nearest:0.00}");
+                            }
+
                             samplesMissing++;
                             samplesHere.Add(ColliderGeometry.PathSample.Missing(p.X, p.Y));
                             continue;
                         }
 
+                        usedMeasured = true;
                         var (bottom, top) = barrier.Value;
 
                         // The railing stands on the floor or tread beside it. That is a better
                         // answer than the minimum of its own geometry, which for coarse geometry is
-                        // the bottom of the whole railing — the floor a storey down.
-                        var surface = ColliderGeometry.SurfaceBaseAt(
-                            manifest, p.X * Ft, -p.Y * Ft, top * Ft, SurfaceRadiusM, SurfaceMinDropM);
+                        // the bottom of the whole railing — the floor a storey down. A climbing
+                        // railing only trusts surfaces with an outline: a level's slab is stored as
+                        // one rectangle for the whole element, and the highest such rectangle under
+                        // a stair railing is the floor of the level above.
+                        var surface = climbs
+                            ? ColliderGeometry.SurfaceHeightUnder(
+                                manifest, p.X * Ft, -p.Y * Ft, top * Ft, SurfaceMinDropM)
+                            : ColliderGeometry.SurfaceBaseAt(
+                                manifest, p.X * Ft, -p.Y * Ft, top * Ft, SurfaceRadiusM,
+                                SurfaceMinDropM);
 
                         if (surface is not null)
                         {
@@ -378,7 +520,8 @@ public static class ColliderExtractor
                     if (pieces.Count > 0)
                     {
                         candidates.AddRange(pieces);
-                        if (outcome == "none") outcome = "measured";
+                        if (outcome == "none")
+                            outcome = usedSurface && !usedMeasured ? "surface" : "measured";
                     }
                 }
 
@@ -390,8 +533,7 @@ public static class ColliderExtractor
                     // Only trustworthy for a flat railing: a box spanning a whole stair flight
                     // would flatten a barrier into the bottom of the flight, so those are left
                     // unplaced and named in the report instead.
-                    var bbox = element.get_BoundingBox(view) ?? element.get_BoundingBox(null);
-                    var span = bbox is null ? 0 : bbox.Max.Z - bbox.Min.Z;
+                    var span = extentFt;
 
                     if (bbox is not null && span > 0.15 / Ft && span <= FlatRailingFt)
                     {
@@ -419,11 +561,13 @@ public static class ColliderExtractor
             }
 
             // ---- 3. no path at all: fit the footprint -----------------------------
-            if (candidates.Count == 0)
+            if (candidates.Count == 0 && !climbs)
             {
-                // Conservative on purpose. One box over the whole railing cannot leak, and a
-                // leakable railing means walking off a stair — a corner cut off a landing is the
-                // better failure. Reported in the export line so it is visible when it happens.
+                // Conservative on purpose, but bounded. One box over a flat railing cannot leak,
+                // and a leakable railing means walking off a stair — a corner cut off a landing is
+                // the better failure. It stops being conservative once the railing climbs or
+                // sweeps: then the fitted rectangle is not the railing, it is a box across the
+                // space the railing runs through, and no collider is the safer answer.
                 GeometryElement? geometry;
                 try { geometry = element.get_Geometry(FineOptions()); }
                 catch { geometry = null; }
@@ -438,7 +582,6 @@ public static class ColliderExtractor
                 }
                 else
                 {
-                    var bbox = element.get_BoundingBox(view) ?? element.get_BoundingBox(null);
                     if (bbox is not null)
                     {
                         plan.Add(new PlanPoint(bbox.Min.X, bbox.Min.Y));
@@ -450,10 +593,10 @@ public static class ColliderExtractor
                     }
                 }
 
-                if (plan.Count >= 3 && maxY > minY)
+                if (plan.Count >= 3 && maxY > minY && maxY - minY <= FlatRailingFt)
                 {
                     var fit = PlanGeometry.MinAreaRect(plan);
-                    if (fit is not null)
+                    if (fit is not null && 2 * fit.Value.HalfThickness * Ft <= MaxFootprintWidthM)
                     {
                         var top = Math.Max(maxY, minY + height);
                         var segment = ColliderGeometry.FromRect(fit.Value, minY, top);
@@ -463,8 +606,14 @@ public static class ColliderExtractor
                             outcome = "footprint";
                         }
                     }
+                    else if (fit is not null)
+                    {
+                        footprintRejected++;
+                    }
                 }
             }
+
+            if (candidates.Count == 0 && outcome == "none") outcome = "unplaced";
 
             var added = Emit(manifest, candidates, emitted, element.Id.Value);
 
@@ -472,12 +621,31 @@ public static class ColliderExtractor
             {
                 case "measured": measured++; break;
                 case "path-3d": fromPath3D++; break;
+                case "surface": fromSurface++; break;
                 case "bbox": fromBox++; break;
                 case "unplaced": unplaced++; break;
                 case "footprint": fromFootprint++; break;
             }
 
             boxes += added;
+            rayAggregateTotal += rayAggregates;
+
+            // The path and the geometry are the two things a railing's collider is built from, and
+            // when a barrier goes missing it is because they disagree. Neither was recorded, so
+            // every diagnosis was an inference from the render mesh; these two strings end that.
+            var pathDigest = path is null
+                ? null
+                : string.Join("; ", path.Take(4).Select((c, i) => c is null
+                    ? $"c{i} null"
+                    : $"c{i} ({c.GetEndPoint(0).X:0.00},{c.GetEndPoint(0).Y:0.00})->" +
+                      $"({c.GetEndPoint(1).X:0.00},{c.GetEndPoint(1).Y:0.00})"));
+
+            var spanDigest = spans.Count == 0
+                ? null
+                : string.Join(" | ", spans.Take(6).Select(s =>
+                    $"z {s.MinZ:0.00}..{s.MaxZ:0.00} x {s.Plan.Min(p => p.X):0.00}..{s.Plan.Max(p => p.X):0.00} " +
+                    $"y {s.Plan.Min(p => p.Y):0.00}..{s.Plan.Max(p => p.Y):0.00}"));
+
             reports.Add(new RailingReport(
                 element.Id.Value,
                 doc.GetElement(element.GetTypeId())?.Name,
@@ -491,11 +659,61 @@ public static class ColliderExtractor
                 candidates.Count > 0 ? candidates.Min(x => x.Y0) : 0f,
                 candidates.Count > 0 ? candidates.Max(x => x.Y1) : 0f,
                 strategy,
-                spans.Count));
+                spans.Count,
+                rayHits,
+                rayAggregates,
+                pathDigest,
+                spanDigest,
+                misses.Count == 0 ? null : string.Join(" ", misses)));
         }
 
         return new RailingStats(
-            found, noCollider, measured, fromPath3D, fromBox, unplaced, fromFootprint, boxes, reports);
+            found, noCollider, measured, fromPath3D, fromSurface, fromBox, unplaced, fromFootprint,
+            footprintRejected, boxes, rayAggregateTotal, reports);
+    }
+
+    /// <summary>
+    /// A barrier sample whose base is the surface under the path point, for a railing that climbs
+    /// and whose own geometry cannot be measured at a point.
+    ///
+    /// The height above that surface is the railing type's own top-rail height, so the barrier
+    /// stops where the railing does. Returns null when nothing walkable is under the point — a
+    /// railing over a void has nowhere to stand, and guessing would put a barrier in mid air.
+    /// </summary>
+    private static ColliderGeometry.PathSample? FromSurface(
+        SceneManifest manifest, double xFt, double yFt, double heightFt, double ceilingFt,
+        double minDropM)
+    {
+        var baseM = ColliderGeometry.SurfaceHeightUnder(
+            manifest, xFt * Ft, -yFt * Ft, ceilingFt * Ft, minDropM);
+
+        if (baseM is null) return null;
+
+        var bottom = baseM.Value / Ft;
+        return new ColliderGeometry.PathSample(
+            xFt, yFt, bottom, bottom + Math.Max(heightFt, MinBarrierFt));
+    }
+
+    /// <summary>
+    /// A barrier sample for a flat railing that is really there but whose own geometry is an
+    /// aggregate at this point: stood on the floor under the path, one railing type-height tall.
+    ///
+    /// Unlike the climbing case this may use a slab recorded as a rectangle, because that is what
+    /// a level's floor is in the manifest, and a flat railing cannot be led astray by the floor of
+    /// the level above the way a climbing one can.
+    /// </summary>
+    private static ColliderGeometry.PathSample? FromSurfaceOnFloor(
+        SceneManifest manifest, double xFt, double yFt, double heightFt, double ceilingFt,
+        double radiusM)
+    {
+        var baseM = ColliderGeometry.SurfaceBaseAt(
+            manifest, xFt * Ft, -yFt * Ft, ceilingFt * Ft, radiusM, SurfaceMinDropM);
+
+        if (baseM is null) return null;
+
+        var bottom = baseM.Value / Ft;
+        return new ColliderGeometry.PathSample(
+            xFt, yFt, bottom, bottom + Math.Max(heightFt, MinBarrierFt));
     }
 
     /// <summary>
@@ -529,6 +747,101 @@ public static class ColliderExtractor
     {
         public required List<PlanPoint> Plan;
         public double MinZ, MaxZ;
+
+        /// <summary>
+        /// The solid itself, already in project coordinates, when the geometry came from a solid
+        /// rather than a mesh. Kept so a path point can be tested with a ray: the plan polygon
+        /// above is the solid's bounding rectangle, which for an L-shaped or twin-curve railing
+        /// covers ground the rail never crosses.
+        /// </summary>
+        public Solid? Source;
+    }
+
+    /// <summary>What a vertical ray through a railing found at one plan point (feet).</summary>
+    private readonly record struct RayHit(bool Hit, bool AggregateOnly, double Bottom, double Top);
+
+    /// <summary>
+    /// Bottom and top of the railing at a plan point, from a vertical ray through its own solids.
+    ///
+    /// The plan-rectangle test above answers "is this point inside the box around a solid", which
+    /// is not the same question as "is there railing here". On the Silo the two answers differed
+    /// both ways: 2.4 m of visible level railing had no barrier because the only solid covering it
+    /// was an aggregate and got skipped, and 230 pieces of barrier ran on through empty space
+    /// because the path wandered inside a solid's rectangle after the railing had turned away.
+    /// </summary>
+    private static RayHit MeasureBarrierByRay(
+        List<SolidSpan> spans, double xFt, double yFt, double aggregateSpanFt, double reachFt)
+    {
+        var minZ = double.MaxValue;
+        var maxZ = double.MinValue;
+        foreach (var span in spans)
+        {
+            if (span.MinZ < minZ) minZ = span.MinZ;
+            if (span.MaxZ > maxZ) maxZ = span.MaxZ;
+        }
+        if (minZ > maxZ) return default;
+
+        Line ray;
+        try
+        {
+            // Path samples arrive in Revit coordinates, and so do the spans, so the ray takes them
+            // as they are. Flipping Y here (as the manifest lookups must, because the scene is in
+            // glTF space) put every ray on the mirrored side of the model.
+            ray = Line.CreateBound(
+                new XYZ(xFt, yFt, maxZ + 1.0),
+                new XYZ(xFt, yFt, minZ - 1.0));
+        }
+        catch { return default; }
+
+        var options = new SolidCurveIntersectionOptions
+        {
+            ResultType = SolidCurveIntersectionMode.CurveSegmentsInside,
+        };
+
+        var hit = false;
+        var bottom = double.MaxValue;
+        var top = double.MinValue;
+
+        foreach (var span in spans)
+        {
+            if (span.Source is null) continue;
+            if (PlanGeometry.DistanceToPolygon(span.Plan, xFt, yFt) > reachFt) continue;
+
+            SolidCurveIntersection? result;
+            try { result = span.Source.IntersectWithCurve(ray, options); }
+            catch { continue; }
+
+            if (result is null || result.SegmentCount == 0) continue;
+
+            var lo = double.MaxValue;
+            var hi = double.MinValue;
+            for (var i = 0; i < result.SegmentCount; i++)
+            {
+                Curve? segment;
+                try { segment = result.GetCurveSegment(i); }
+                catch { continue; }
+                if (segment is null) continue;
+
+                foreach (var end in new[] { segment.GetEndPoint(0), segment.GetEndPoint(1) })
+                {
+                    if (end.Z < lo) lo = end.Z;
+                    if (end.Z > hi) hi = end.Z;
+                }
+            }
+            if (lo > hi) continue;
+
+            hit = true;
+
+            // the same aggregate case as the rectangle test: one solid standing in for the whole
+            // railing says nothing about the height at one point along it
+            if (hi - lo > aggregateSpanFt) continue;
+
+            if (lo < bottom) bottom = lo;
+            if (hi > top) top = hi;
+        }
+
+        if (!hit) return default;
+        return bottom > top ? new RayHit(true, true, 0, 0) : new RayHit(true, false, bottom, top);
     }
 
     /// <summary>
@@ -560,6 +873,38 @@ public static class ColliderExtractor
         }
 
         return found ? (bottom, top) : null;
+    }
+
+    /// <summary>
+    /// Whether a point lies inside the railing's own plan footprint (the union of its solids'
+    /// plan bounds), within a slack.
+    ///
+    /// A railing's *reported* geometry is only a stand-in for it, and at coarse detail that stand-in
+    /// is a slanted box whose edge can miss the railing by most of a metre. The path is the better
+    /// guide to where the railing is, so where the stand-in fails to reach the path the barrier is
+    /// still placed — but only inside the element's own extent, so a path that runs away from the
+    /// railing cannot conjure barriers in open floor.
+    /// </summary>
+    private static bool InsidePlanExtent(List<SolidSpan> spans, double x, double y, double slackFt)
+    {
+        if (spans.Count == 0) return false;
+
+        var minX = double.MaxValue;
+        var maxX = double.MinValue;
+        var minY = double.MaxValue;
+        var maxY = double.MinValue;
+
+        foreach (var span in spans)
+        foreach (var point in span.Plan)
+        {
+            if (point.X < minX) minX = point.X;
+            if (point.X > maxX) maxX = point.X;
+            if (point.Y < minY) minY = point.Y;
+            if (point.Y > maxY) maxY = point.Y;
+        }
+
+        return x >= minX - slackFt && x <= maxX + slackFt &&
+               y >= minY - slackFt && y <= maxY + slackFt;
     }
 
     /// <summary>
@@ -600,6 +945,43 @@ public static class ColliderExtractor
         }
 
         strategy = "none";
+        return false;
+    }
+
+    /// <summary>
+    /// Reads the railing again at a detail level the first ladder never tries: fine geometry that
+    /// includes non-visible objects, with and without the view.
+    ///
+    /// <c>get_Geometry</c> answers with the view-dependent representation, and for a railing the
+    /// fine pass can come back empty while its elements still render — which is the case that
+    /// leaves a gap in the barrier with nothing in the report to explain it. This is the cheap
+    /// retry; <c>spanDigest</c> in the report says what it found.
+    /// </summary>
+    private static bool TryCollectFineNonVisible(Element element, View view, List<SolidSpan> spans)
+    {
+        foreach (var make in new Func<Options>[]
+                 {
+                     () => new Options
+                     {
+                         ComputeReferences = false, IncludeNonVisibleObjects = true,
+                         DetailLevel = ViewDetailLevel.Fine, View = view,
+                     },
+                     () => new Options
+                     {
+                         ComputeReferences = false, IncludeNonVisibleObjects = true,
+                         DetailLevel = ViewDetailLevel.Fine,
+                     },
+                 })
+        {
+            GeometryElement? geometry;
+            try { geometry = element.get_Geometry(make()); }
+            catch { continue; }
+            if (geometry is null) continue;
+
+            CollectSpans(geometry, Transform.Identity, spans, 0);
+            if (spans.Count > 0) return true;
+        }
+
         return false;
     }
 
@@ -658,7 +1040,14 @@ public static class ColliderExtractor
                         maxZ = Math.Max(maxZ, Math.Max(low.Z, high.Z));
                     }
 
-                    spans.Add(new SolidSpan { Plan = corners, MinZ = minZ, MaxZ = maxZ });
+                    Solid? source = null;
+                    try
+                    {
+                        source = transform.IsIdentity ? solid : SolidUtils.CreateTransformed(solid, transform);
+                    }
+                    catch { source = null; }
+
+                    spans.Add(new SolidSpan { Plan = corners, MinZ = minZ, MaxZ = maxZ, Source = source });
                     break;
                 }
 

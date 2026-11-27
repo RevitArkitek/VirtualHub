@@ -88,10 +88,13 @@ function geometryNear(x1, z1, x2, z2, pad = 0.45) {
 }
 
 // ---- check every railing box -------------------------------------------------------------
-// Railing boxes carry a fixed 0.1 m thickness; walls carry the wall's width.
+// Railing colliders are the ones stamped with the element they came from; walls and furniture
+// carry no sourceId. Selecting on the stamp rather than on the 0.1 m railing thickness matters:
+// a footprint box carries the fitted rectangle's width instead, which is exactly the shape most
+// worth checking.
 const MAX_RAILING_HEIGHT = 1.6;   // metres — nothing in a railing is taller than this
-const railings = manifest.segments.filter((s) => Math.abs((s.thickness ?? 0.2) - 0.1) < 0.005);
-const missing = [], below = [], above = [], tall = [];
+const railings = manifest.segments.filter((s) => s.sourceId != null);
+const missing = [], below = [], above = [], tall = [], enclosing = [];
 
 for (const s of railings) {
   const where = `(${s.x1.toFixed(2)}, ${s.z1.toFixed(2)})→(${s.x2.toFixed(2)}, ${s.z2.toFixed(2)})`;
@@ -104,16 +107,73 @@ for (const s of railings) {
   else if (s.y0 > g.hi + 0.15) above.push(`${where} collider y ${s.y0.toFixed(2)}..${s.y1.toFixed(2)} vs geometry y ${g.lo.toFixed(2)}..${g.hi.toFixed(2)} — barrier ABOVE the railing`);
 }
 
-console.log(`railcheck: ${railings.length} railing colliders, ${vertexCount.toLocaleString()} render vertices`);
-for (const m of [...below, ...above, ...missing, ...tall]) console.log('  BAD ' + m);
+// ---- no railing collider may stand in the middle of a walking surface ---------------------
+// A barrier is meant to run along the edge of a floor or a tread, never across it. A footprint
+// rectangle fitted over a curved railing breaks that rule spectacularly: three boxes in the Silo
+// enclosed every one of its 420 spiral-stair treads, so the whole stair tower was impassable.
+const surfaces = manifest.surfaces || [];
+function planOf(s) {
+  if (s.p && s.p.length >= 6) {
+    const poly = [];
+    for (let i = 0; i + 1 < s.p.length; i += 2) poly.push([s.p[i], s.p[i + 1]]);
+    return poly;
+  }
+  return [[s.minX, s.minZ], [s.maxX, s.minZ], [s.maxX, s.maxZ], [s.minX, s.maxZ]];
+}
+function inside(poly, x, z) {
+  let c = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, zi] = poly[i], [xj, zj] = poly[j];
+    if ((zi > z) !== (zj > z) && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) c = !c;
+  }
+  return c;
+}
+function footprint(s) {
+  const dx = s.x2 - s.x1, dz = s.z2 - s.z1, L = Math.hypot(dx, dz);
+  if (L < 1e-9) return null;
+  const t = s.thickness / 2, nx = -dz / L * t, nz = dx / L * t;
+  return [[s.x1 + nx, s.z1 + nz], [s.x2 + nx, s.z2 + nz], [s.x2 - nx, s.z2 - nz], [s.x1 - nx, s.z1 - nz]];
+}
 
-const bad = below.length + above.length + tall.length;
+let enclosedCount = 0;
+const enclosedBy = new Map();
+for (const surface of surfaces) {
+  const poly = planOf(surface);
+  const cx = poly.reduce((a, p) => a + p[0], 0) / poly.length;
+  const cz = poly.reduce((a, p) => a + p[1], 0) / poly.length;
+  for (const s of railings) {
+    // the barrier has to rise out of the walking surface, not merely start at it
+    if (!(surface.y > s.y0 + 0.05) || surface.y > s.y1) continue;
+    const box = footprint(s);
+    if (box && inside(box, cx, cz)) {
+      enclosedCount++;
+      const id = s.sourceId ?? '?';
+      if (!enclosedBy.has(id)) enclosedBy.set(id, 0);
+      enclosedBy.set(id, enclosedBy.get(id) + 1);
+      break;
+    }
+  }
+}
+if (enclosedCount > 0) {
+  const worst = [...enclosedBy.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+  enclosing.push(
+    `${enclosedCount} walkable surfaces have a railing collider standing on them (${worst
+      .map(([id, n]) => `element ${id}: ${n}`)
+      .join(', ')}${enclosedBy.size > worst.length ? ', …' : ''}) — those floors or treads are blocked`
+  );
+}
+
+console.log(`railcheck: ${railings.length} railing colliders, ${vertexCount.toLocaleString()} render vertices`);
+for (const m of [...below, ...above, ...missing, ...tall, ...enclosing]) console.log('  BAD ' + m);
+
+const bad = below.length + above.length + tall.length + enclosing.length;
 console.log(
   bad === 0
-    ? `\nall ${railings.length} railing colliders are railing-sized and overlap rendered geometry`
+    ? `\nall ${railings.length} railing colliders are railing-sized, overlap rendered geometry, and leave the floors alone`
     : `\n${bad} of ${railings.length} railing colliders are wrong` +
       (below.length + above.length ? `, ${below.length + above.length} do not match the rendered railing` : '') +
       (tall.length ? `, ${tall.length} are taller than a railing` : '') +
-      (missing.length ? `, ${missing.length} sit where nothing renders` : '')
+      (missing.length ? `, ${missing.length} sit where nothing renders` : '') +
+      (enclosing.length ? `, ${enclosedCount} walkable surfaces are walled off` : '')
 );
 process.exit(bad === 0 ? 0 : 1);

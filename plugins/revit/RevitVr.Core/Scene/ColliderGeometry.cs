@@ -175,6 +175,35 @@ public static class ColliderGeometry
     /// </summary>
     public static double? SurfaceBaseAt(
         SceneManifest manifest, double x, double z, double top, double radius, double minDrop)
+        => HighestSurfaceBelow(manifest, x, z, top, radius, minDrop);
+
+    /// <summary>
+    /// Height of the walking surface a railing's path point stands on, when the railing's own
+    /// geometry cannot say (metres).
+    ///
+    /// Only surfaces with a real outline count. A floor slab or roof is recorded as a rectangle —
+    /// the whole element's box — so one can cover a stair it does not stand over, and taking the
+    /// highest such box under a climbing railing picks the floor of the level above. Treads carry
+    /// their own outline, which is why they are the surfaces this can trust.
+    ///
+    /// The search starts within a hand's width and only widens to a metre if that finds nothing.
+    /// The difference matters on a stair: a metre's radius reaches the treads half a turn above,
+    /// and taking the highest of those lifts the barrier clear of the tread the railing actually
+    /// guards — a barrier you can walk under is worse than none, because nothing looks wrong.
+    ///
+    /// This is the fallback for coarse railing geometry: a curved or climbing railing arrives as
+    /// one aggregate solid over the whole element, whose minimum is the bottom of the flight and
+    /// whose maximum is its top, so no single point along it can be measured from it.
+    /// </summary>
+    public static double? SurfaceHeightUnder(
+        SceneManifest manifest, double x, double z, double ceiling, double minDrop,
+        double nearRadius = 0.15, double wideRadius = 1.0)
+        => HighestSurfaceBelow(manifest, x, z, ceiling, nearRadius, minDrop, outlinedOnly: true)
+           ?? HighestSurfaceBelow(manifest, x, z, ceiling, wideRadius, minDrop, outlinedOnly: true);
+
+    private static double? HighestSurfaceBelow(
+        SceneManifest manifest, double x, double z, double top, double radius, double minDrop,
+        bool outlinedOnly = false)
     {
         double? best = null;
 
@@ -192,6 +221,7 @@ public static class ColliderGeometry
 
                 if (PlanGeometry.DistanceToPolygon(polygon, x, z) > radius) continue;
             }
+            else if (outlinedOnly) continue;
 
             if (best is null || surface.Y > best) best = surface.Y;
         }

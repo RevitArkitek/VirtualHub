@@ -136,6 +136,33 @@ Check("zero thickness still collides",
     ColliderGeometry.AlongPath(new (double, double, double)[] { (0, 0, 0), (3, 0, 0) }, 3, 0)
         .All(s => s.Thickness >= (float)ColliderGeometry.MinThicknessMetres));
 
+// ---------------------------------------------------------------- snapping a barrier onto a rail
+// A railing's path is its sketch line, and a wall-mounted pipe can run most of a metre beside it.
+var railQuad = new[] { P(0, 0), P(4, 0), P(4, 1), P(0, 1) };
+var inside = PlanGeometry.NearestPointOnPolygon(railQuad, 2, 0.5);
+Check("snap: a point already on the railing does not move",
+    Near(inside.Distance, 0) && Near(inside.X, 2) && Near(inside.Y, 0.5),
+    $"({inside.X:0.###},{inside.Y:0.###}) d{inside.Distance:0.###}");
+
+var beside = PlanGeometry.NearestPointOnPolygon(railQuad, 2, 1.75);
+Check("snap: a point beside the railing lands on its edge",
+    Near(beside.Distance, 0.75) && Near(beside.X, 2) && Near(beside.Y, 1),
+    $"({beside.X:0.###},{beside.Y:0.###}) d{beside.Distance:0.###}");
+
+var pastEnd = PlanGeometry.NearestPointOnPolygon(railQuad, 5, 0.5);
+Check("snap: a point past the end lands on the end",
+    Near(pastEnd.Distance, 1) && Near(pastEnd.X, 4) && Near(pastEnd.Y, 0.5),
+    $"({pastEnd.X:0.###},{pastEnd.Y:0.###}) d{pastEnd.Distance:0.###}");
+
+// The real case: 1211619's rail is 0.99 ft off its path at one end of the run and further at the
+// other, so the offset grows along it. Snapping has to follow that, not average it away.
+var skew = new[] { P(0.10, 37.66), P(1.0, 37.66), P(3.4, 0), P(2.0, 0) };
+var top = PlanGeometry.NearestPointOnPolygon(skew, 0, 37.0);
+var bottom = PlanGeometry.NearestPointOnPolygon(skew, 0, 0.5);
+Check("snap: an offset that grows along the run is followed",
+    top.Distance < 0.2 && bottom.Distance > top.Distance * 5,
+    $"top d{top.Distance:0.00} bottom d{bottom.Distance:0.00}");
+
 // ---------------------------------------------------------------- footprint boxes
 var r30 = PlanGeometry.MinAreaRect(rotated);
 var box = r30 is null ? null : ColliderGeometry.FromRect(r30.Value, baseFt: 0, topFt: 3);
@@ -286,6 +313,120 @@ Check("base follows the treads up a flight",
     string.Join(" ", bases.Select(b => b?.ToString("0.00") ?? "null")));
 Check("treads are matched just outside their outline",
     ColliderGeometry.SurfaceBaseAt(stairManifest, 0.75, -0.75, 3.0, radius: 1.0, minDrop: 0.25) is not null);
+
+// ---------------------------------------------------------------- barrier base on a spiral stair
+// The Silo's stair railings: coarse geometry arrives as one solid over the whole flight, so the
+// only local height is the tread underneath. Within a metre of a path point on a spiral there are
+// several treads a riser or two apart, and taking the highest of them lifts the barrier clear of
+// the tread it guards — a barrier you walk under. SurfaceHeightUnder must find the one underfoot.
+var spiral = new SceneManifest();
+const double RiserM = 0.187;
+const int SpiralTreads = 24;
+for (var i = 0; i < SpiralTreads; i++)
+{
+    var a0 = i * 10.0 * Math.PI / 180.0;
+    var a1 = (i + 1) * 10.0 * Math.PI / 180.0;
+    var y = RiserM * (i + 1);
+    var quad = new List<float>();
+    foreach (var a in new[] { a0, a1 })
+        foreach (var r in new[] { 1.6, 3.6 })
+            quad.AddRange(new[] { (float)(r * Math.Cos(a)), (float)(r * Math.Sin(a)) });
+    spiral.Surfaces.Add(new WalkSurface
+    {
+        MinX = quad.Where((_, k) => k % 2 == 0).Min(),
+        MaxX = quad.Where((_, k) => k % 2 == 0).Max(),
+        MinZ = quad.Where((_, k) => k % 2 == 1).Min(),
+        MaxZ = quad.Where((_, k) => k % 2 == 1).Max(),
+        Y = (float)y,
+        P = new[] { quad[0], quad[1], quad[2], quad[3], quad[6], quad[7], quad[4], quad[5] },
+    });
+}
+
+// a point at the outer edge of three treads: the base must be each tread's own height, not one
+// of the risers above it that a metre's search would reach
+var onTread = new List<double?>();
+for (var i = 1; i < SpiralTreads; i += 6)
+{
+    var mid = (i + 0.5) * 10.0 * Math.PI / 180.0;
+    onTread.Add(ColliderGeometry.SurfaceHeightUnder(
+        spiral, 3.2 * Math.Cos(mid), 3.2 * Math.Sin(mid), ceiling: 10.0, minDrop: 0.25));
+}
+Check("base under a spiral path point is the tread it stands on",
+    onTread.All(b => b is not null) &&
+    onTread.Zip(new[] { 1, 7, 13, 19 }, (b, i) => Math.Abs(b!.Value - RiserM * (i + 1)) < 0.01).All(x => x),
+    string.Join(" ", onTread.Select(b => b?.ToString("0.000") ?? "null")) + " expected " +
+    string.Join(" ", new[] { 1, 7, 13, 19 }.Select(i => (RiserM * (i + 1)).ToString("0.000"))));
+
+var lastBase = ColliderGeometry.SurfaceHeightUnder(
+    spiral, 3.2 * Math.Cos((SpiralTreads - 0.5) * 10 * Math.PI / 180),
+    3.2 * Math.Sin((SpiralTreads - 0.5) * 10 * Math.PI / 180), ceiling: 1.5, minDrop: 0.25);
+Check("a tread above the railing's own top is not its base",
+    lastBase is null || lastBase < RiserM * SpiralTreads - 0.25,
+    lastBase?.ToString("0.000") ?? "null");
+
+Check("nothing under the path returns null",
+    ColliderGeometry.SurfaceHeightUnder(spiral, 40, 40, 10.0, 0.25) is null);
+
+// a slab recorded as a rectangle only: its box is the whole element, so it says nothing about
+// where its floor really is — and one covering the stair would otherwise win over the tread
+var slabOnly = new SceneManifest();
+slabOnly.Surfaces.Add(new WalkSurface { MinX = 0f, MaxX = 10f, MinZ = -5f, MaxZ = 5f, Y = 2f });
+Check("a rectangle-only slab is not a barrier base",
+    ColliderGeometry.SurfaceHeightUnder(slabOnly, 5, 0, ceiling: 5.0, minDrop: 0.25) is null);
+
+// the trap this was written for: in the Silo every level slab is stored as one big rectangle, so
+// the floor of the level above is the highest "surface" under a climbing railing's path
+var storey = new SceneManifest();
+for (var level = 0; level < 4; level++)
+    storey.Surfaces.Add(new WalkSurface { MinX = -20f, MaxX = 20f, MinZ = -20f, MaxZ = 20f, Y = level * 4f });
+storey.Surfaces.Add(new WalkSurface
+{
+    MinX = 2.5f, MaxX = 3.5f, MinZ = -0.5f, MaxZ = 0.5f, Y = 1.2f,
+    P = new[] { 2.5f, -0.5f, 3.5f, -0.5f, 3.5f, 0.5f, 2.5f, 0.5f },
+});
+Check("a tread beats the slab boxes stacked over it",
+    Math.Abs((ColliderGeometry.SurfaceHeightUnder(storey, 3, 0, ceiling: 6.0, minDrop: 0.25) ?? -99) - 1.2) < 0.01,
+    ColliderGeometry.SurfaceHeightUnder(storey, 3, 0, 6.0, 0.25)?.ToString("0.000") ?? "null");
+
+// ---------------------------------------------------------------- the Silo's stair railing
+// Reproduced from the real export: one railing's coarse geometry fitted to a 10.9 x 9.1 m
+// rectangle standing 4.72 m tall, over a spiral stair whose treads are 0.187 m apart. The
+// rectangle was emitted as a collider and enclosed every tread of the flight.
+var sweepCorners = new List<PlanPoint>
+{
+    P(-1.05f, 5.62f), P(8.08f, 5.62f), P(8.08f, -5.25f), P(-1.05f, -5.25f),
+};
+var sweep = PlanGeometry.MinAreaRect(sweepCorners);
+const double MaxFootprintWidthM = 2.5;
+Check("a footprint fitted to a curved railing's sweep is refused as a railing",
+    sweep is not null && 2 * sweep.Value.HalfThickness * ColliderGeometry.FeetToMetres > MaxFootprintWidthM,
+    sweep is null ? "no fit" : (2 * sweep.Value.HalfThickness * ColliderGeometry.FeetToMetres).ToString("0.00"));
+
+// the barrier that replaces it: one sample per tread, stood on the tread, railing-height above it
+// (the manifest keeps metres and the path fixtures keep feet — the extractor divides, so this does)
+const double RailHeightM = 0.813;
+var climbSamples = new List<ColliderGeometry.PathSample>();
+for (var i = 0; i < SpiralTreads; i++)
+{
+    var mid = (i + 0.5) * 10.0 * Math.PI / 180.0;
+    var xy = (X: 3.2 * Math.Cos(mid), Y: 3.2 * Math.Sin(mid));
+    var baseM = ColliderGeometry.SurfaceHeightUnder(spiral, xy.X, xy.Y, ceiling: 10.0, minDrop: 0.25);
+    if (baseM is null) continue;
+    var baseFt = baseM.Value / ColliderGeometry.FeetToMetres;
+    climbSamples.Add(new ColliderGeometry.PathSample(
+        xy.X / ColliderGeometry.FeetToMetres, xy.Y / ColliderGeometry.FeetToMetres,
+        baseFt, baseFt + RailHeightM / ColliderGeometry.FeetToMetres));
+}
+var climbPieces = ColliderGeometry.AlongPath(climbSamples, thicknessFt: 0.1 / ColliderGeometry.FeetToMetres);
+Check("a climbing railing becomes many railing-sized boxes, not one tall one",
+    climbPieces.Count >= SpiralTreads - 1 && climbPieces.All(s => s.Y1 - s.Y0 <= 1.6f),
+    $"{climbPieces.Count} pieces, tallest {(climbPieces.Count == 0 ? 0 : climbPieces.Max(s => s.Y1 - s.Y0)):0.00} m");
+Check("the climbing barrier rises with the stair",
+    climbPieces.Count > 0 && climbPieces.Zip(climbPieces.Skip(1)).All(p => p.Second.Y0 >= p.First.Y0 - 0.01f),
+    climbPieces.Count == 0 ? "no pieces" : $"{climbPieces[0].Y0:0.00} -> {climbPieces[^1].Y0:0.00}");
+Check("every piece starts on the tread it guards",
+    climbPieces.All(s => spiral.Surfaces.Any(w => Math.Abs(w.Y - s.Y0) < RiserM + 1e-3f)),
+    climbPieces.Count == 0 ? "no pieces" : $"first {climbPieces[0].Y0:0.00}");
 
 Console.WriteLine($"{pass} passed, {fail} failed");
 return fail == 0 ? 0 : 1;
