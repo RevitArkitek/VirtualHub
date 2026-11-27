@@ -68,6 +68,14 @@ public static class ColliderExtractor
     // ray at it (feet). Slack, not tolerance: the ray decides, this only skips distant solids.
     private const double RayReachFt = 0.5;
 
+    // How far a slab outline may deviate from the real edge once its loops are thinned (metres).
+    // Big enough to turn a tessellated 50 m circle into ~50 points, small enough that "the floor
+    // stops here" is still true to a few centimetres.
+    private const double OutlineToleranceM = 0.05;
+
+    // Most upward faces one slab may contribute as separate walkable surfaces.
+    private const int MaxFacesPerSlab = 64;
+
     /// <summary>
     /// Categories that stop you walking through them. Doors are deliberately absent: a door gets
     /// a gap cut in its host wall instead, and a leaf you cannot pass would defeat the point.
@@ -158,7 +166,7 @@ public static class ColliderExtractor
             }
         }
 
-        AddFloorSurfaces(doc, view, manifest);
+        var floors = AddFloorSurfaces(doc, view, manifest);
         var wallSegments = manifest.Segments.Count;
         var treads = AddStairSurfaces(doc, view, manifest);
         var terrainTris = AddTerrainTriangles(doc, view, manifest);
@@ -173,8 +181,23 @@ public static class ColliderExtractor
             $"{railings.FromSurface} on the surface under the path, " +
             $"{railings.FromBox} bbox-placed, {railings.Unplaced} unplaced, " +
             $"{railings.FromFootprint} footprint, {railings.NoCollider} No Collider); " +
-            $"{manifest.Surfaces.Count - treads} floor/roof surfaces, {treads} stair treads, " +
+            $"{floors.Outlined + floors.FromBox} floor/roof surfaces " +
+            $"({floors.WithHoles} with a stairwell or shaft hole cut out, " +
+            $"{floors.FromBox} from a bounding box), {treads} stair treads, " +
             $"{terrainTris} terrain triangles");
+
+        if (floors.Sloped > 0)
+            manifest.Warnings.Add(
+                $"{floors.Sloped} floor/roof surfaces are sloped and were flattened to a walk plane at " +
+                $"their highest edge (drop up to {floors.MaxDropM:0.00} m). A ramp is walked as a " +
+                "level surface at the top of its slope.");
+
+        if (floors.FromBox > 0)
+            manifest.Warnings.Add(
+                $"{floors.FromBox} floor/roof slabs could not be read as their own outline and fell " +
+                $"back to their bounding box, so any stairwell or shaft in them is filled with a " +
+                $"phantom floor (ids {string.Join(", ", floors.BoxIds)}). Walking down such an " +
+                "opening will stop at storey level.");
 
         if (doorStats.Found > 0 && doorStats.Matched == 0)
             manifest.Warnings.Add("Every door failed to match a wall — doorways will be impassable.");
@@ -198,6 +221,21 @@ public static class ColliderExtractor
             manifest.Warnings.Add(
                 $"{railings.FromBox} railings could not be measured from their geometry and were " +
                 "placed from their bounding box. Fine for a flat railing; check them in the headset.");
+
+        // A barrier whose height jumps between surfaces along the path becomes a run of thin slats:
+        // one piece per 0.35 m of jump, hundreds of them, and the railing no longer reads as a
+        // railing. Sampling is every 0.6 m, so more than three boxes per sample cannot be a legit
+        // stair pitch — it is a barrier standing on two different things.
+        var slatted = railings.Reports
+            .Where(r => r.Samples > 0 && r.Boxes > 3 * r.Samples)
+            .ToList();
+
+        if (slatted.Count > 0)
+            manifest.Warnings.Add(
+                $"{slatted.Count} railings produced more than three boxes per path sample (ids " +
+                $"{string.Join(", ", slatted.Take(8).Select(r => r.Id))}) — their barrier height is " +
+                "jumping between surfaces along the path, which reads as a wall of thin slats in the " +
+                "headset. Check what those samples are standing on before trusting the barriers.");
 
         if (railings.FootprintRejected > 0)
             manifest.Warnings.Add(
@@ -229,6 +267,17 @@ public static class ColliderExtractor
     }
 
     private readonly record struct DoorStats(int Found, int Matched, int Unmatched);
+
+    /// <summary>
+    /// What the floor harvest managed, per element: read as its own outline, read with a hole cut
+    /// out of it, or fallen back to a bounding box because its geometry could not be read.
+    /// </summary>
+    private readonly record struct FloorStats(
+        int Outlined, int WithHoles, int FromBox, IReadOnlyList<long> BoxIds,
+        int Sloped, double MaxDropM);
+
+    /// <summary>One walkable face: its plan outline, and the height its barrier stands at (metres).</summary>
+    private readonly record struct TopShell(PlanShell Shell, double TopM, double DropM);
 
     private readonly record struct RailingStats(
         int Found, int NoCollider, int Measured, int FromPath3D, int FromSurface, int FromBox,
@@ -1229,18 +1278,44 @@ public static class ColliderExtractor
         return ((found, matched, found - matched), openings);
     }
 
-    private static void AddFloorSurfaces(Document doc, View view, SceneManifest manifest)
+    private static FloorStats AddFloorSurfaces(Document doc, View view, SceneManifest manifest)
     {
         // Roofs count as walkable ground: a flat roof should behave exactly like a floor slab.
         var walkable = new[] { BuiltInCategory.OST_Floors, BuiltInCategory.OST_Roofs };
 
+        var outlined = 0;
+        var withHoles = 0;
+        var fromBox = 0;
+        var boxIds = new List<long>();
+        var sloped = 0;
+        var maxDrop = 0.0;
+
         foreach (var category in walkable)
         {
-            foreach (var surface in new FilteredElementCollector(doc, view.Id)
+            foreach (var element in new FilteredElementCollector(doc, view.Id)
                          .OfCategory(category)
                          .WhereElementIsNotElementType())
             {
-                var bbox = surface.get_BoundingBox(view) ?? surface.get_BoundingBox(null);
+                var shells = TopShells(element, view);
+                if (shells.Count > 0)
+                {
+                    foreach (var shell in shells)
+                    {
+                        var surface = SurfaceFromShell(shell);
+                        if (surface is null) continue;
+                        manifest.Surfaces.Add(surface);
+                        outlined++;
+                        if (surface.H is { Length: > 0 }) withHoles++;
+                        if (shell.DropM > OutlineToleranceM)
+                        {
+                            sloped++;
+                            maxDrop = Math.Max(maxDrop, shell.DropM);
+                        }
+                    }
+                    continue;
+                }
+
+                var bbox = element.get_BoundingBox(view) ?? element.get_BoundingBox(null);
                 if (bbox is null) continue;
                 if (bbox.Max.X - bbox.Min.X < 1e-3 || bbox.Max.Y - bbox.Min.Y < 1e-3) continue;
 
@@ -1251,15 +1326,20 @@ public static class ColliderExtractor
                     MaxX = (float)(bbox.Max.X * Ft),
                     MaxZ = (float)(-bbox.Min.Y * Ft),
                     Y = (float)(bbox.Max.Z * Ft),
+                    Slab = true,
                 });
+                fromBox++;
+                if (boxIds.Count < 8) boxIds.Add(element.Id.Value);
             }
         }
 
-        if (manifest.Surfaces.Count > 0) return;
+        if (manifest.Surfaces.Count > 0)
+            return new FloorStats(outlined, withHoles, fromBox, boxIds, sloped, maxDrop);
 
         // Fallback: treat every level as an infinite walkable plane across the model extents.
         var modelBox = ModelBounds(doc, view);
-        if (modelBox is null) return;
+        if (modelBox is null)
+            return new FloorStats(outlined, withHoles, fromBox, boxIds, sloped, maxDrop);
         foreach (var level in new FilteredElementCollector(doc).OfClass(typeof(Level)).Cast<Level>())
         {
             manifest.Surfaces.Add(new WalkSurface
@@ -1269,8 +1349,200 @@ public static class ColliderExtractor
                 MaxX = (float)(modelBox.Max.X * Ft) + 5f,
                 MaxZ = (float)(-modelBox.Min.Y * Ft) + 5f,
                 Y = (float)(level.Elevation * Ft),
+                Slab = true,
             });
         }
+
+        return new FloorStats(outlined, withHoles, fromBox, boxIds, sloped, maxDrop);
+    }
+
+    /// <summary>
+    /// The upward-facing faces of a slab, as outlines with the holes cut out of them.
+    ///
+    /// A slab's bounding box is not the slab. A floor drawn around a stairwell is a ring, and its
+    /// box spans the opening — so the walkable world gains a phantom floor across the top of the
+    /// stair, the ground snap holds the player at storey level for as long as the head is over the
+    /// stair, and the flight cannot be descended. The debug overlay shows it plainly as one green
+    /// square across the whole storey. The same is true of a lift shaft, a duct penetration, an
+    /// atrium edge, or any other inner loop in the sketch.
+    ///
+    /// So read the face itself: the outer loop is the outline, every loop inside it is a hole. The
+    /// ladder of geometry requests mirrors the railing one, because <c>get_Geometry</c> answers with
+    /// the view-dependent representation and a floor can come back empty from a request that works
+    /// for the wall beside it.
+    /// </summary>
+    private static List<TopShell> TopShells(Element element, View view)
+    {
+        var attempts = new Func<Options>[]
+        {
+            () => FineOptions(view),
+            () => FineOptions(),
+            () => new Options
+            {
+                ComputeReferences = false, IncludeNonVisibleObjects = true,
+                DetailLevel = ViewDetailLevel.Fine, View = view,
+            },
+            () => new Options
+            {
+                ComputeReferences = false, IncludeNonVisibleObjects = true,
+                DetailLevel = ViewDetailLevel.Coarse,
+            },
+        };
+
+        foreach (var make in attempts)
+        {
+            GeometryElement? geometry;
+            try { geometry = element.get_Geometry(make()); }
+            catch { continue; }
+            if (geometry is null) continue;
+
+            var shells = new List<TopShell>();
+            CollectTopShells(geometry, Transform.Identity, shells, 0);
+            if (shells.Count == 0) continue;
+
+            if (shells.Count > MaxFacesPerSlab)
+            {
+                // a slab split into hundreds of faces is a pathological sketch or a site pad, and
+                // 500 surfaces for one element would cost the viewer more than it is worth
+                shells.Sort((a, b) => b.Shell.Area.CompareTo(a.Shell.Area));
+                shells.RemoveRange(MaxFacesPerSlab, shells.Count - MaxFacesPerSlab);
+            }
+
+            return shells;
+        }
+
+        return new List<TopShell>();
+    }
+
+    private static void CollectTopShells(
+        GeometryElement geometry, Transform transform, List<TopShell> shells, int depth)
+    {
+        if (depth > 10) return;
+
+        foreach (var obj in geometry)
+        {
+            switch (obj)
+            {
+                case GeometryInstance instance:
+                {
+                    GeometryElement? symbol = null;
+                    try { symbol = instance.GetSymbolGeometry(); } catch { symbol = null; }
+                    if (symbol is not null)
+                    {
+                        CollectTopShells(symbol, transform.Multiply(instance.Transform), shells, depth + 1);
+                        break;
+                    }
+
+                    GeometryElement? placed = null;
+                    try { placed = instance.GetInstanceGeometry(); } catch { placed = null; }
+                    if (placed is not null) CollectTopShells(placed, transform, shells, depth + 1);
+                    break;
+                }
+
+                case Solid solid when solid.Faces.Size > 0:
+                    foreach (Face face in solid.Faces)
+                    {
+                        var shell = TopShellOf(face, transform);
+                        if (shell is not null) shells.Add(shell.Value);
+                    }
+                    break;
+            }
+        }
+    }
+
+    /// <summary>One upward-facing planar face as an outline plus holes, or null when it is not one.</summary>
+    private static TopShell? TopShellOf(Face face, Transform transform)
+    {
+        if (face is not PlanarFace planar) return null;
+
+        // Only the surface you can stand on. Everything steeper than about 25 degrees is a side
+        // face or a stair soffit, and a steeply sloped slab is left to the level fallback rather
+        // than claimed as floor you can walk up.
+        var normal = transform.OfVector(planar.FaceNormal);
+        if (normal.Z < 0.9) return null;
+
+        IList<CurveLoop>? loops;
+        try { loops = planar.GetEdgesAsCurveLoops(); }
+        catch { return null; }
+        if (loops is null || loops.Count == 0) return null;
+
+        var planLoops = new List<IReadOnlyList<PlanPoint>>(loops.Count);
+        var minY = double.MaxValue;
+        var maxY = double.MinValue;
+
+        foreach (CurveLoop loop in loops)
+        {
+            var points = new List<PlanPoint>();
+
+            foreach (Curve curve in loop)
+            {
+                List<XYZ> curvePoints;
+                try { curvePoints = Tessellate(curve); }
+                catch { continue; }
+
+                foreach (var p in curvePoints)
+                {
+                    var world = transform.OfPoint(p);
+                    points.Add(new PlanPoint(world.X * Ft, -world.Y * Ft));
+                    minY = Math.Min(minY, world.Z * Ft);
+                    maxY = Math.Max(maxY, world.Z * Ft);
+                }
+            }
+
+            var thinned = PlanGeometry.Simplify(points, OutlineToleranceM);
+            if (thinned.Count >= 3) planLoops.Add(thinned);
+        }
+
+        if (planLoops.Count == 0) return null;
+
+        var shell = PlanGeometry.Shell(planLoops, out _);
+        if (shell is null) return null;
+
+        return new TopShell(shell.Value, maxY, maxY - minY);
+    }
+
+    private static WalkSurface? SurfaceFromShell(TopShell top)
+    {
+        var outer = top.Shell.Outer;
+        if (outer.Count < 3) return null;
+
+        var flat = FlatOutline(outer);
+        if (flat.Length < 6) return null;
+
+        var surface = new WalkSurface
+        {
+            MinX = (float)outer.Min(p => p.X),
+            MaxX = (float)outer.Max(p => p.X),
+            MinZ = (float)outer.Min(p => p.Y),
+            MaxZ = (float)outer.Max(p => p.Y),
+            Y = (float)top.TopM,
+            P = flat,
+            Slab = true,          // railing bases keep treating this as a rectangle; see WalkSurface.Slab
+        };
+
+        if (top.Shell.Holes.Count > 0)
+        {
+            var holes = new List<float[]>(top.Shell.Holes.Count);
+            foreach (var hole in top.Shell.Holes)
+            {
+                var flatHole = FlatOutline(hole);
+                if (flatHole.Length >= 6) holes.Add(flatHole);
+            }
+            if (holes.Count > 0) surface.H = holes.ToArray();
+        }
+
+        return surface;
+    }
+
+    private static float[] FlatOutline(IReadOnlyList<PlanPoint> points)
+    {
+        var flat = new float[points.Count * 2];
+        for (var i = 0; i < points.Count; i++)
+        {
+            flat[i * 2] = (float)points[i].X;
+            flat[i * 2 + 1] = (float)points[i].Y;
+        }
+        return flat;
     }
 
     /// <summary>

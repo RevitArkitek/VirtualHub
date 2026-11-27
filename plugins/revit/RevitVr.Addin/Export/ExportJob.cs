@@ -320,25 +320,53 @@ public static class ExportJob
         var z = manifest.Spawn[2];
 
         var standing = surfaces.Any(s =>
-            x >= s.MinX && x <= s.MaxX &&
-            z >= s.MinZ && z <= s.MaxZ &&
+            s.Contains(x, z) &&
             y >= s.Y - 0.5f && y <= s.Y + 3.5f);
         if (standing) return;
 
         var lowest = surfaces.Min(s => s.Y);
         var ground = surfaces
             .Where(s => Math.Abs(s.Y - lowest) < 0.3f)
-            .OrderByDescending(s => (s.MaxX - s.MinX) * (s.MaxZ - s.MinZ))
+            .OrderByDescending(s => s.Area)
             .First();
 
-        manifest.Spawn = new[]
-        {
-            (ground.MinX + ground.MaxX) / 2f,
-            ground.Y + manifest.EyeHeight,
-            (ground.MinZ + ground.MaxZ) / 2f,
-        };
+        var (spawnX, spawnZ) = PointOn(ground);
+        manifest.Spawn = new[] { spawnX, ground.Y + manifest.EyeHeight, spawnZ };
         manifest.SpawnForward = new[] { 0f, 0f, -1f };
         manifest.Warnings.Add("View camera was outside the model; spawn moved to the largest ground-floor slab.");
+    }
+
+    /// <summary>
+    /// A point you can actually stand on within a surface.
+    ///
+    /// The middle of a floor slab is not on the floor when the slab is a ring around a stairwell:
+    /// the bounding-box centre falls into the opening, and spawning there drops the player down
+    /// the stair. So ask the surface itself, widening a grid of interior points until one lands on
+    /// it, and fall back to the centre only when nothing does.
+    /// </summary>
+    private static (float X, float Z) PointOn(WalkSurface surface)
+    {
+        var cx = (surface.MinX + surface.MaxX) / 2f;
+        var cz = (surface.MinZ + surface.MaxZ) / 2f;
+        if (surface.Contains(cx, cz)) return (cx, cz);
+
+        var width = surface.MaxX - surface.MinX;
+        var depth = surface.MaxZ - surface.MinZ;
+
+        for (var steps = 8; steps <= 128; steps *= 2)
+        {
+            for (var i = 0; i < steps; i++)
+            {
+                for (var j = 0; j < steps; j++)
+                {
+                    var x = surface.MinX + width * (i + 0.5f) / steps;
+                    var z = surface.MinZ + depth * (j + 0.5f) / steps;
+                    if (surface.Contains(x, z)) return (x, z);
+                }
+            }
+        }
+
+        return (cx, cz);
     }
 
     /// <summary>Starts the static server if it isn't already listening. Returns the port.</summary>

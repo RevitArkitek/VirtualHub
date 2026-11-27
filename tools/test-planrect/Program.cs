@@ -428,5 +428,98 @@ Check("every piece starts on the tread it guards",
     climbPieces.All(s => spiral.Surfaces.Any(w => Math.Abs(w.Y - s.Y0) < RiserM + 1e-3f)),
     climbPieces.Count == 0 ? "no pieces" : $"first {climbPieces[0].Y0:0.00}");
 
+// ---------------------------------------------------------------- floor outlines and holes
+// A floor drawn around a stairwell is a ring, and its bounding box is not the floor. These are
+// the pieces that turn the face's loops into a walkable surface with the stairwell left open.
+
+var ringOuter = new List<PlanPoint> { P(0, 0), P(10, 0), P(10, 10), P(0, 10) };
+var ringHole = new List<PlanPoint> { P(3, 3), P(3, 7), P(7, 7), P(7, 3) };   // wound the other way
+var ringShell = PlanGeometry.Shell(new IReadOnlyList<PlanPoint>[] { ringHole, ringOuter }, out var ringDropped);
+Check("a donut face keeps its outer loop and its hole", ringShell is not null
+    && ringShell.Value.Outer.Count == 4 && ringShell.Value.Holes.Count == 1 && ringDropped == 0,
+    ringShell is null ? "no shell" : $"{ringShell.Value.Holes.Count} holes, {ringDropped} dropped");
+Check("the outer loop is found by area, not by winding order", ringShell is not null
+    && Near(Math.Abs(PlanGeometry.SignedArea(ringShell.Value.Outer)), 100),
+    ringShell is null ? "no shell" : Math.Abs(PlanGeometry.SignedArea(ringShell.Value.Outer)).ToString("0.0"));
+Check("the walkable area is the ring, not the box", ringShell is not null
+    && Near(ringShell.Value.Area, 84), ringShell is null ? "no shell" : ringShell.Value.Area.ToString("0.0"));
+
+var stray = new List<PlanPoint> { P(40, 40), P(44, 40), P(44, 44) };
+var strayShell = PlanGeometry.Shell(new IReadOnlyList<PlanPoint>[] { ringOuter, stray }, out var strayDropped);
+Check("a loop outside the face is reported dropped, not treated as a hole",
+    strayShell is not null && strayShell.Value.Holes.Count == 0 && strayDropped == 1,
+    $"{strayShell?.Holes.Count} holes, {strayDropped} dropped");
+
+// the manifest carries outlines flat, so the test that matters is on the flat array
+var flatRing = new float[] { 0, 0, 10, 0, 10, 10, 0, 10 };
+var flatHole = new[] { 3f, 3f, 7f, 3f, 7f, 7f, 3f, 7f };
+Check("flat outline: a point on the ring is inside", PlanGeometry.IsInside(flatRing, 1, 1));
+Check("flat outline: a point in the hole is outside the ring's outline only",
+    PlanGeometry.IsInside(flatRing, 5, 5));
+
+var donut = new WalkSurface
+{
+    MinX = 0, MinZ = 0, MaxX = 10, MaxZ = 10, Y = 3f,
+    P = flatRing, H = new[] { flatHole },
+};
+Check("surface contains the ring", donut.Contains(1, 1) && donut.Contains(9, 5));
+Check("surface does not contain the stairwell", !donut.Contains(5, 5));
+Check("surface area subtracts the hole", Near(donut.Area, 84), donut.Area.ToString("0.0"));
+
+// A tessellated circle must not turn into thousands of collider points, and must not be
+// simplified so hard that the outline drifts off the real edge.
+const double circleR = 25.9;
+var circle = new List<PlanPoint>();
+for (var i = 0; i < 720; i++)
+{
+    var a = i * Math.PI / 360.0;
+    circle.Add(P(circleR * Math.Cos(a), circleR * Math.Sin(a)));
+}
+var thinnedCircle = PlanGeometry.Simplify(circle, 0.05);
+var worstSagitta = 0.0;
+for (var i = 0; i < thinnedCircle.Count; i++)
+{
+    var a = thinnedCircle[i];
+    var b = thinnedCircle[(i + 1) % thinnedCircle.Count];
+    var mx = (a.X + b.X) / 2;
+    var my = (a.Y + b.Y) / 2;
+    worstSagitta = Math.Max(worstSagitta, circleR - Math.Sqrt(mx * mx + my * my));
+}
+Check("a tessellated circle thins to a usable outline", thinnedCircle.Count >= 3 && thinnedCircle.Count <= 200,
+    $"{thinnedCircle.Count} points from {circle.Count}");
+Check("thinning keeps the edge within its tolerance", worstSagitta <= 0.05 + 1e-9,
+    $"worst sagitta {worstSagitta:0.000} m");
+
+var openRect = new List<PlanPoint> { P(0, 0), P(4, 0), P(4, 3), P(0, 3) };
+Check("thinning keeps every corner of a rectangle", PlanGeometry.Simplify(openRect, 0.05).Count == 4,
+    $"{PlanGeometry.Simplify(openRect, 0.05).Count} points");
+
+// ---------------------------------------------------------------- railing bases vs a donut floor
+// Two lookups, two rules, and the split is deliberate. A *climbing* railing only trusts outlined
+// surfaces, and a slab is never one of them — that rule used to hold because slabs had no outline
+// at all, and letting the new outline in re-placed 25 barriers onto the slab beside the stair.
+// A *flat* railing still finds a slab by its rectangle, exactly as before outlines existed.
+var donutStorey = new SceneManifest();
+donutStorey.Surfaces.Add(new WalkSurface { MinX = -10, MinZ = -10, MaxX = 10, MaxZ = 10, Y = 3f,
+    P = new[] { -10f, -10f, 10f, -10f, 10f, 10f, -10f, 10f },
+    H = new[] { new[] { -6f, -6f, 6f, -6f, 6f, 6f, -6f, 6f } }, Slab = true });
+donutStorey.Surfaces.Add(new WalkSurface { MinX = -6, MinZ = -6, MaxX = 6, MaxZ = 6, Y = 2.8f,
+    P = new[] { -6f, -6f, 6f, -6f, 6f, 6f, -6f, 6f } });
+var overStairClimbing = ColliderGeometry.SurfaceHeightUnder(donutStorey, 0, 0, ceiling: 4.0, minDrop: 0.25);
+var onRingClimbing = ColliderGeometry.SurfaceHeightUnder(donutStorey, 8, 0, ceiling: 4.0, minDrop: 0.25);
+Check("a climbing railing over the stairwell stands on the tread, not the slab's box",
+    overStairClimbing is not null && Near(overStairClimbing.Value, 2.8),
+    overStairClimbing?.ToString("0.00") ?? "null");
+Check("a climbing railing never stands on a slab, ring or not", onRingClimbing is null,
+    onRingClimbing?.ToString("0.00") ?? "null (right)");
+var overStairFlat = ColliderGeometry.SurfaceBaseAt(donutStorey, 0, 0, top: 4.0, radius: 0.15, minDrop: 0.25);
+Check("a flat railing still finds its slab by the rectangle, as before the outline",
+    overStairFlat is not null && Near(overStairFlat.Value, 3.0), overStairFlat?.ToString("0.00") ?? "null");
+
+// the viewer reads camelCase, so the field name is part of the contract
+var donutJson = donutStorey.ToJson();
+Check("the manifest writes the hole as 'h'", donutJson.Contains("\"h\":"),
+    donutJson.Contains("\"h\":") ? "found" : donutJson[..Math.Min(200, donutJson.Length)]);
+
 Console.WriteLine($"{pass} passed, {fail} failed");
 return fail == 0 ? 0 : 1;

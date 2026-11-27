@@ -16,15 +16,37 @@ export class CollisionWorld {
    */
   constructor(segments = [], surfaces = [], terrain = [], cellSize = 4) {
     this.segments = [];
-    this.surfaces = (surfaces || []).map((s) => ({
-      y: s.y,
-      minX: s.minX ?? -Infinity,
-      minZ: s.minZ ?? -Infinity,
-      maxX: s.maxX ?? Infinity,
-      maxZ: s.maxZ ?? Infinity,
-      // a stair tread is a polygon, a floor slab is a rectangle
-      poly: Array.isArray(s.p) && s.p.length >= 6 ? s.p : null,
-    }));
+    this.surfaces = (surfaces || []).map((s) => {
+      // A stair tread is a polygon, a floor slab is a rectangle — and a slab drawn around a
+      // stairwell is a rectangle with a hole in it. The hole is not decoration: without it the
+      // slab covers the opening, groundAt keeps returning storey level over the stair, and the
+      // flight cannot be descended.
+      const poly = Array.isArray(s.p) && s.p.length >= 6 ? s.p : null;
+      const holes = Array.isArray(s.h)
+        ? s.h.filter((h) => Array.isArray(h) && h.length >= 6)
+        : null;
+      return {
+        y: s.y,
+        minX: s.minX ?? -Infinity,
+        minZ: s.minZ ?? -Infinity,
+        maxX: s.maxX ?? Infinity,
+        maxZ: s.maxZ ?? Infinity,
+        poly,
+        holes,
+        // a bounding box per hole, so the common case (standing nowhere near a hole) costs four
+        // comparisons instead of a polygon walk every frame
+        holeBoxes: holes ? holes.map((h) => {
+          let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
+          for (let i = 0; i < h.length; i += 2) {
+            if (h[i] < minX) minX = h[i];
+            if (h[i] > maxX) maxX = h[i];
+            if (h[i + 1] < minZ) minZ = h[i + 1];
+            if (h[i + 1] > maxZ) maxZ = h[i + 1];
+          }
+          return [minX, minZ, maxX, maxZ];
+        }) : null,
+      };
+    });
 
     // Sloped ground. Triangles are indexed into a coarse grid because a site mesh can run to
     // tens of thousands of them and testing all of it every frame would not hold 72 fps.
@@ -191,6 +213,7 @@ export class CollisionWorld {
       if (s.y > fromY + maxStep) continue;
       if (s.y < fromY - maxDrop) continue;
       if (s.poly && !pointInPolygon(s.poly, x, z)) continue;
+      if (s.holes && insideHole(s, x, z)) continue;
       if (best === null || s.y > best) best = s.y;
     }
 
@@ -233,6 +256,17 @@ function pointInPolygon(p, x, z) {
     if ((zi > z) !== (zj > z) && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) inside = !inside;
   }
   return inside;
+}
+
+/** True when (x,z) falls inside one of a surface's holes — the stairwell of a donut floor. */
+function insideHole(s, x, z) {
+  const boxes = s.holeBoxes;
+  for (let i = 0; i < s.holes.length; i++) {
+    const b = boxes[i];
+    if (x < b[0] || x > b[2] || z < b[1] || z > b[3]) continue;   // nowhere near this hole
+    if (pointInPolygon(s.holes[i], x, z)) return true;
+  }
+  return false;
 }
 
 /**

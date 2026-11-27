@@ -213,7 +213,17 @@ public static class ColliderGeometry
             if (z < surface.MinZ - radius || z > surface.MaxZ + radius) continue;
             if (surface.Y > top - minDrop) continue;
 
-            if (surface.P is { Length: >= 6 })
+            // A slab contributes its rectangle and nothing else, and is never a climbing railing's
+            // base. Both rules predate slabs having outlines, and both are load-bearing: the
+            // outlines were added for the walkable world, and letting them in here re-placed 25
+            // railing barriers onto the slab beside the stair (8,070 boxes became 20,256, and 5
+            // railings lost pieces). A slab's outline is the wrong witness for a barrier anyway —
+            // the slab that matches under a climbing railing is the one a storey up.
+            if (surface.Slab)
+            {
+                if (outlinedOnly) continue;
+            }
+            else if (surface.P is { Length: >= 6 })
             {
                 var polygon = new List<PlanPoint>(surface.P.Length / 2);
                 for (var i = 0; i + 1 < surface.P.Length; i += 2)

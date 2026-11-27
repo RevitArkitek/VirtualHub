@@ -67,6 +67,27 @@ Schema: [`contracts/library.schema.json`](../contracts/library.schema.json).
 | `exportedUtc` | ISO-8601; the list is sorted by it, newest first |
 | `triangles` | for the card; the viewer counts the real number again on load |
 
+## colliders.json
+
+The collision world, derived analytically from the source elements rather than from the render
+mesh, so a whole storey of walls costs a few hundred 2D tests. Metres, glTF space (Y up, −Z is
+Revit +Y).
+
+| Field | Meaning |
+|---|---|
+| `segments[]` | `{x1,z1,x2,z2,thickness,y0,y1,solid,sourceId}` — one box per wall run, railing piece or obstacle. `sourceId` names the ElementId for Revit railings |
+| `surfaces[]` | walkable planes the ground snap uses: `{y, minX, minZ, maxX, maxZ, p?, h?}` |
+| `terrain[]` | sloped ground as triangles, nine floats each; height is interpolated across them |
+| `spawn`, `spawnForward`, `eyeHeight` | where the player starts |
+| `warnings[]` | what the exporter thought was worth saying — read it first when a model behaves strangely |
+
+A surface's `minX…maxZ` is the bounding box and is only a cheap pre-filter. `p` is the outline as a
+flat `[x,z,x,z,…]` polygon, and `h` is a list of holes cut out of it, same format. A floor slab
+drawn around a stairwell is exactly that shape: without its hole the slab's box spans the opening,
+the ground snap holds the player at storey level over the stair, and the flight cannot be descended.
+`tools/floorshape.py <scene> --y <height> --compare` checks the surfaces against the render mesh at
+one floor height, so a phantom floor is visible as a number rather than as a complaint.
+
 ## HTTP routes
 
 Both servers implement these; `tools/conformance.py` asserts they answer identically.

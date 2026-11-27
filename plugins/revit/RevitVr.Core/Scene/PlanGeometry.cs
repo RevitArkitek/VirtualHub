@@ -2,6 +2,23 @@ namespace RevitVr.Core.Scene;
 
 public readonly record struct PlanPoint(double X, double Y);
 
+/// <summary>
+/// One plan face reduced to what the walkable world needs: an outer boundary and the holes cut
+/// inside it. A floor slab drawn around a stairwell is exactly this — a donut — and treating it
+/// as its bounding box fills the stairwell with a phantom floor you cannot descend through.
+/// </summary>
+public readonly record struct PlanShell(
+    IReadOnlyList<PlanPoint> Outer,
+    IReadOnlyList<IReadOnlyList<PlanPoint>> Holes)
+{
+    /// <summary>Walkable area: the outer boundary less whatever is cut out of it, in the caller's units squared.</summary>
+    public double Area =>
+        Math.Abs(PlanGeometry.SignedArea(Outer)) -
+        Holes.Sum(hole => Math.Abs(PlanGeometry.SignedArea(hole)));
+
+    public bool HasHoles => Holes.Count > 0;
+}
+
 /// <summary>An oriented rectangle in plan: centre, unit direction, and half extents.</summary>
 public readonly record struct PlanRect(
     double Cx, double Cy,
@@ -225,5 +242,178 @@ public static class PlanGeometry
                 inside = !inside;
         }
         return inside;
+    }
+
+    /// <summary>
+    /// Crossing-number test on a flat [x,y,x,y,...] polygon, which is how outlines are carried in
+    /// the manifest. Kept separate so the exporter and the spawn sanity check test the exact
+    /// numbers the player's collision world will see, not a re-derived copy.
+    /// </summary>
+    public static bool IsInside(ReadOnlySpan<float> flat, double x, double y)
+    {
+        var n = flat.Length / 2;
+        if (n < 3) return false;
+
+        var inside = false;
+        for (int i = 0, j = n - 1; i < n; j = i++)
+        {
+            double xi = flat[i * 2], yi = flat[i * 2 + 1];
+            double xj = flat[j * 2], yj = flat[j * 2 + 1];
+            if (yi > y != yj > y &&
+                x < (xj - xi) * (y - yi) / (yj - yi) + xi)
+                inside = !inside;
+        }
+        return inside;
+    }
+
+    /// <summary>Signed plan area by the shoelace formula; negative when the winding is clockwise.</summary>
+    public static double SignedArea(IReadOnlyList<PlanPoint> polygon)
+    {
+        var n = polygon.Count;
+        if (n < 3) return 0;
+
+        var sum = 0.0;
+        for (int i = 0, j = n - 1; i < n; j = i++)
+            sum += (polygon[j].X - polygon[i].X) * (polygon[j].Y + polygon[i].Y);
+        return sum / 2;
+    }
+
+    /// <summary>
+    /// The loops of one Revit face split into its outer boundary and its holes.
+    ///
+    /// A face's loops arrive unordered and with no marker saying which is which, and the winding
+    /// is not dependable across element types, so the largest loop by area is taken as the outer
+    /// boundary and every other loop that lies inside it is a hole. A loop that is not inside it
+    /// is counted as dropped rather than silently treated as a hole: it means the face was not the
+    /// simple outline the caller assumed, and the export report should be able to say so.
+    /// </summary>
+    public static PlanShell? Shell(IReadOnlyList<IReadOnlyList<PlanPoint>> loops, out int dropped)
+    {
+        dropped = 0;
+
+        var outerIndex = -1;
+        var outerArea = 0.0;
+        for (var i = 0; i < loops.Count; i++)
+        {
+            var loop = loops[i];
+            if (loop.Count < 3) continue;
+            var area = Math.Abs(SignedArea(loop));
+            if (area <= outerArea) continue;
+            outerArea = area;
+            outerIndex = i;
+        }
+
+        if (outerIndex < 0 || outerArea < 1e-6) return null;
+
+        IReadOnlyList<PlanPoint> outer = loops[outerIndex];
+
+        var holes = new List<IReadOnlyList<PlanPoint>>();
+        for (var i = 0; i < loops.Count; i++)
+        {
+            var loop = loops[i];
+            if (i == outerIndex || loop.Count < 3) continue;
+            var minX = double.MaxValue; var maxX = double.MinValue;
+            var minY = double.MaxValue; var maxY = double.MinValue;
+            foreach (var p in loop)
+            {
+                minX = Math.Min(minX, p.X); maxX = Math.Max(maxX, p.X);
+                minY = Math.Min(minY, p.Y); maxY = Math.Max(maxY, p.Y);
+            }
+
+            // a hole is inside the face whichever way its own outline is wound, so test the
+            // middle of its extent as well as a vertex: a hole that shares vertices with the
+            // outer boundary reports "outside" for those vertices
+            var inside = IsInside(outer, loop[0].X, loop[0].Y) ||
+                         IsInside(outer, (minX + maxX) / 2, (minY + maxY) / 2);
+
+            if (inside) holes.Add(loop);
+            else dropped++;
+        }
+
+        return new PlanShell(outer, holes);
+    }
+
+    /// <summary>
+    /// Douglas–Peucker thinning of a closed ring, in the caller's units.
+    ///
+    /// A tessellated 50 m circle arrives as thousands of points, which would dwarf every other
+    /// collider in the manifest for no gain — the outline only has to say "the floor stops here"
+    /// to within a couple of centimetres. The ring is split at the vertex farthest from the first
+    /// one so both halves are simplified as open chains; a plain run over a closed ring would
+    /// collapse it onto the start-to-end line.
+    /// </summary>
+    public static List<PlanPoint> Simplify(IReadOnlyList<PlanPoint> ring, double tolerance)
+    {
+        var pts = new List<PlanPoint>(ring.Count);
+        foreach (var p in ring)
+            if (pts.Count == 0 || Math.Abs(pts[^1].X - p.X) > 1e-9 || Math.Abs(pts[^1].Y - p.Y) > 1e-9)
+                pts.Add(p);
+        if (pts.Count > 1 && Math.Abs(pts[0].X - pts[^1].X) <= 1e-9 && Math.Abs(pts[0].Y - pts[^1].Y) <= 1e-9)
+            pts.RemoveAt(pts.Count - 1);
+
+        if (pts.Count < 4 || tolerance <= 0) return pts;
+
+        var far = 1;
+        var farDist = -1.0;
+        for (var i = 1; i < pts.Count; i++)
+        {
+            var dx = pts[i].X - pts[0].X;
+            var dy = pts[i].Y - pts[0].Y;
+            var d = dx * dx + dy * dy;
+            if (d <= farDist) continue;
+            farDist = d;
+            far = i;
+        }
+
+        var keep = new bool[pts.Count];
+        keep[0] = true;
+        keep[far] = true;
+        keep[pts.Count - 1] = true;
+
+        SimplifySpan(pts, 0, far, tolerance, keep);
+        SimplifySpan(pts, far, pts.Count - 1, tolerance, keep);
+
+        var result = new List<PlanPoint>();
+        for (var i = 0; i < pts.Count; i++) if (keep[i]) result.Add(pts[i]);
+        return result.Count >= 3 ? result : pts;
+    }
+
+    private static void SimplifySpan(
+        List<PlanPoint> pts, int first, int last, double tolerance, bool[] keep)
+    {
+        var stack = new Stack<(int First, int Last)>();
+        stack.Push((first, last));
+
+        while (stack.Count > 0)
+        {
+            var (a, b) = stack.Pop();
+            if (b <= a + 1) continue;
+
+            var worst = 0.0;
+            var index = -1;
+            for (var i = a + 1; i < b; i++)
+            {
+                var d = DistanceToSegment(pts[i], pts[a], pts[b]);
+                if (d <= worst) continue;
+                worst = d;
+                index = i;
+            }
+
+            if (index < 0 || worst <= tolerance) continue;
+            keep[index] = true;
+            stack.Push((a, index));
+            stack.Push((index, b));
+        }
+    }
+
+    private static double DistanceToSegment(PlanPoint p, PlanPoint a, PlanPoint b)
+    {
+        var dx = b.X - a.X;
+        var dy = b.Y - a.Y;
+        var len2 = dx * dx + dy * dy;
+        var t = len2 < 1e-18 ? 0 : Math.Clamp(((p.X - a.X) * dx + (p.Y - a.Y) * dy) / len2, 0, 1);
+        var px = a.X + dx * t;
+        var py = a.Y + dy * t;
+        return Math.Sqrt((p.X - px) * (p.X - px) + (p.Y - py) * (p.Y - py));
     }
 }

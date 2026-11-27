@@ -210,6 +210,32 @@ for (let i = 0; i < 360; i++) {
 check('stairs beside the railing still climb to the landing', Math.abs(sy - 1.7) < 0.02,
   `ended at y=${sy.toFixed(2)}`);
 
+// A floor drawn around a stairwell is a donut, and the ground snap has to fall through it. This
+// is the shape a ring-shaped slab reaches the viewer as: an outline with a hole, plus the treads
+// in the opening. Without the hole the slab's box covers the stair and you can never descend it.
+const donut = new CollisionWorld([], [
+  { minX: -10, minZ: -10, maxX: 10, maxZ: 10, y: 3.0,
+    p: [-10, -10, 10, -10, 10, 10, -10, 10],
+    h: [[-6, -6, 6, -6, 6, 6, -6, 6]] },
+  { minX: -6, minZ: -6, maxX: 6, maxZ: 6, y: 2.8,
+    p: [-6, -6, 6, -6, 6, 6, -6, 6] },
+]);
+const onRing = donut.groundAt(8, 0, 3.0);
+const overStair = donut.groundAt(0, 0, 3.0);
+check('donut floor: the ring is ground', onRing !== null && Math.abs(onRing - 3.0) < 1e-6,
+  String(onRing));
+check('donut floor: the stairwell is not, and the tread below is', overStair !== null && Math.abs(overStair - 2.8) < 1e-6,
+  String(overStair));
+
+// A hole must not let a surface's box stand in for it anywhere: the outline outside the polygon
+// is not floor either, however much of the box it fills.
+const triangle = new CollisionWorld([], [
+  { minX: -10, minZ: -10, maxX: 10, maxZ: 10, y: 3.0, p: [-10, -10, 10, -10, 0, 10] },
+]);
+check('outline, not box: inside the triangle is ground', triangle.groundAt(-2, 0, 3.0) !== null);
+check('outline, not box: the box corner under nothing is not ground', triangle.groundAt(9, 9, 3.0) === null,
+  String(triangle.groundAt(9, 9, 3.0)));
+
 console.log(`\n${pass} passed, ${fail} failed   (${world.stats.tests} narrow-phase tests)`);
 console.log(`grid: ${world.segments.length} segments in ${world.stats.gridCells} cells`);
 process.exit(fail ? 1 : 0);

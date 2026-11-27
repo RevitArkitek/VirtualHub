@@ -44,21 +44,49 @@ function groundFromPolygons(surfaces) {
           ? [s.minX, s.minZ, s.maxX, s.minZ, s.maxX, s.maxZ, s.minX, s.maxZ]
           : null);
     if (!flat) continue;
-    const contour = [];
-    for (let i = 0; i < flat.length; i += 2) {
-      contour.push(new THREE.Vector2(flat[i], flat[i + 1]));
-    }
+
+    const toContour = (ring) => {
+      const contour = [];
+      for (let i = 0; i < ring.length; i += 2) contour.push(new THREE.Vector2(ring[i], ring[i + 1]));
+      return contour;
+    };
+
+    const contour = toContour(flat);
+    // Holes are what a donut floor is: the stairwell. Drop them and the overlay paints the
+    // whole storey green, which is exactly the phantom floor the collision engine used to have.
+    const holes = (Array.isArray(s.h) ? s.h : [])
+      .filter((h) => Array.isArray(h) && h.length >= 6)
+      .map(toContour);
+
     let faces = [];
+    let verts = contour;
     try {
-      faces = THREE.ShapeUtils.triangulateShape(contour, []);
+      faces = THREE.ShapeUtils.triangulateShape(contour, holes);
     } catch (e) {
       faces = [];
     }
+
+    // triangulateShape indexes into the contour followed by each hole, in order
+    if (faces.length && holes.length) verts = contour.concat(...holes);
+
+    if (!faces.length && holes.length) {
+      // earcut gave up on the holes: a slab with a hole still has to show something, so draw the
+      // outline alone rather than nothing at all
+      try {
+        faces = THREE.ShapeUtils.triangulateShape(contour, []);
+      } catch (e) {
+        faces = [];
+      }
+      verts = contour;
+    }
+
     if (!faces.length) continue;
+
     const y = s.y + 0.005;              // a hair above the model's own floor
     for (const [a, b, c] of faces) {
       for (const idx of [a, b, c]) {
-        const p = contour[idx];
+        const p = verts[idx];
+        if (!p) continue;
         positions.push(p.x, y, p.y);
       }
     }

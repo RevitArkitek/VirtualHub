@@ -42,9 +42,73 @@ public sealed class WalkSurface
     /// Optional plan outline as a flat [x,z,x,z,...] polygon. When present it is the shape that
     /// counts and the rectangle above is only a cheap pre-filter. Stair treads need this: they
     /// are often not axis-aligned, and a bounding box would turn a diagonal flight into a slab
-    /// you can walk around on.
+    /// you can walk around on. Floor slabs need it for the opposite reason — see <see cref="H"/>.
     /// </summary>
     public float[]? P { get; set; }
+
+    /// <summary>
+    /// Holes cut out of <see cref="P"/>, each a flat [x,z,x,z,...] polygon.
+    ///
+    /// A floor slab drawn around a stairwell is a donut, and its bounding box is not the slab: the
+    /// box spans the opening, so the walkable world holds a phantom floor across the top of the
+    /// stair and the ground snap never lets you down it. Carrying the face's inner loops as holes
+    /// is what makes the stairwell a hole you can walk into rather than a floor you stand on.
+    /// </summary>
+    public float[][]? H { get; set; }
+
+    /// <summary>
+    /// True for a surface that came from a floor or roof element rather than from a stair tread.
+    ///
+    /// Railing barriers are placed from "the surface under the path", and that lookup deliberately
+    /// keeps treating a slab the way it did before slabs had outlines: as its bounding rectangle,
+    /// and never as an outline a climbing railing may trust. Those are the rules the barrier
+    /// heights were tuned against — a slab is the wrong answer for a climbing railing whichever
+    /// shape it has, because the slab that matches is the one a storey up. The walkable world
+    /// itself uses the real shape (see <see cref="Contains"/>); this flag is not serialised.
+    /// </summary>
+    [JsonIgnore]
+    public bool Slab { get; set; }
+
+    /// <summary>
+    /// True when (x,z) is on this surface: inside its rectangle, inside its outline if it has one,
+    /// and outside every hole.
+    /// </summary>
+    public bool Contains(double x, double z)
+    {
+        if (x < MinX || x > MaxX || z < MinZ || z > MaxZ) return false;
+
+        if (P is { Length: >= 6 } && !PlanGeometry.IsInside(P.AsSpan(), x, z)) return false;
+
+        if (H is { Length: > 0 })
+            foreach (var hole in H)
+                if (hole is { Length: >= 6 } && PlanGeometry.IsInside(hole.AsSpan(), x, z)) return false;
+
+        return true;
+    }
+
+    /// <summary>Walkable area in m², less any holes; used to pick the largest ground surface.</summary>
+    public double Area
+    {
+        get
+        {
+            var area = (double)(MaxX - MinX) * (MaxZ - MinZ);
+            if (P is { Length: >= 6 })
+            {
+                area = Math.Abs(PlanGeometry.SignedArea(ToPoints(P)));
+                if (H is { Length: > 0 })
+                    foreach (var hole in H)
+                        if (hole is { Length: >= 6 }) area -= Math.Abs(PlanGeometry.SignedArea(ToPoints(hole)));
+            }
+            return area;
+        }
+    }
+
+    private static List<PlanPoint> ToPoints(float[] flat)
+    {
+        var points = new List<PlanPoint>(flat.Length / 2);
+        for (var i = 0; i + 1 < flat.Length; i += 2) points.Add(new PlanPoint(flat[i], flat[i + 1]));
+        return points;
+    }
 }
 
 public sealed class SceneManifest
